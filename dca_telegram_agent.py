@@ -3,394 +3,464 @@ import re
 import json
 import time
 import html
+import random
 import traceback
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
 import feedparser
+from bs4 import BeautifulSoup
 
-# -----------------------------
-# CONFIG (Set these in Render -> Environment)
-# -----------------------------
+# =========================
+# CONFIG (ENV VARIABLES)
+# =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # e.g. @DCAUPSC (channel username) or numeric chat_id
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # e.g. "@DCAUPSC"
 
-DIFFICULTY = os.getenv("DIFFICULTY", "moderate").strip().lower()
-NUM_POLLS = int(os.getenv("NUM_POLLS", "10"))
-NUM_MAINS = int(os.getenv("NUM_MAINS", "2"))
+# Model: keep small/cheap; change if you want
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# PIB official RSS (reliable)
+# How many items to feed agent
+MAX_HEADLINES_TOTAL = int(os.getenv("MAX_HEADLINES_TOTAL", "25"))
+
+# Output requirements
+MCQ_COUNT = 10
+MAINS_COUNT = 2
+DIFFICULTY = "moderate"
+
+# PIB RSS (official)
 PIB_RSS_URLS = [
-    "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",  # Press Releases RSS
+    "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",  # Press Releases (English)
 ]
 
-# Non-RSS sites: scrape headlines
-SCRAPE_SOURCES = {
-    "RBI_PRESS_RELEASES": "https://www.rbi.org.in/commonman/english/scripts/PressReleases.aspx",
-    "PRS_BILLTRACK": "https://prsindia.org/billtrack",
-    "INSIGHTS_CA": "https://www.insightsonindia.com/current-affairs-upsc/",
-    "PWONLYIAS_CA": "https://pwonlyias.com/current-affairs/",
+# =========================
+# TELEGRAM LIMITS (IMPORTANT)
+# =========================
+TG_POLL_Q_MAX = 300
+TG_POLL_OPT_MAX = 100
+TG_POLL_MAX_OPTIONS = 10
+TG_MSG_MAX = 3900  # keep below 4096 safe
+
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+session = requests.Session()
+session.headers.update(UA)
 
-# Telegram limits (important)
-TG_POLL_Q_MAX = 290       # keep < 300 safe
-TG_POLL_OPT_MAX = 90      # keep < 100 safe
-TG_POLL_EXPL_MAX = 3500   # message limit is higher but keep practical
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def log(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
-
+# =========================
+# UTIL
+# =========================
 def clean_text(s: str) -> str:
-    s = html.unescape(s or "")
+    if not s:
+        return ""
+    s = html.unescape(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def truncate(s: str, n: int) -> str:
+def clip(s: str, n: int) -> str:
     s = clean_text(s)
     if len(s) <= n:
         return s
-    return s[: n - 1].rstrip() + "…"
+    return s[: max(0, n - 1)].rstrip() + "…"
 
-def http_get(url: str, timeout=20) -> str:
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=timeout)
+def uniq_by_title(items):
+    seen = set()
+    out = []
+    for it in items:
+        t = clean_text(it.get("title", ""))
+        key = t.lower()
+        if not t or key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+def safe_get(url, timeout=20):
+    r = session.get(url, timeout=timeout)
     r.raise_for_status()
     return r.text
 
-# -----------------------------
-# Telegram API
-# -----------------------------
-def tg_api(method: str, payload: dict):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=30)
-    if not r.ok:
-        raise requests.HTTPError(f"{r.status_code} {r.text}")
-    return r.json()
-
-def tg_send_message(text: str, parse_mode: str = None, disable_preview=True):
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": disable_preview
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    return tg_api("sendMessage", payload)
-
-def tg_send_poll(question: str, options: list, correct_index: int):
-    # Telegram rules: 2-10 options, each <=100 chars, question <=300 chars
-    options = [truncate(o, TG_POLL_OPT_MAX) for o in options][:10]
-    question = truncate(question, TG_POLL_Q_MAX)
-    if len(options) < 2:
-        raise ValueError("Poll needs at least 2 options.")
-    if correct_index < 0 or correct_index >= len(options):
-        correct_index = 0
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "question": question,
-        "options": options,
-        "type": "quiz",
-        "correct_option_id": int(correct_index),
-        "is_anonymous": False,
-        "allows_multiple_answers": False
-    }
-    return tg_api("sendPoll", payload)
-
-# -----------------------------
-# OpenAI (Responses API)
-# -----------------------------
-def openai_responses(prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing.")
-
-    url = "https://api.openai.com/v1/responses"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": MODEL,
-        "input": prompt,
-    }
-    r = requests.post(url, headers=headers, json=body, timeout=90)
-    r.raise_for_status()
-    data = r.json()
-
-    # Extract text from response
-    out_text = ""
-    for item in data.get("output", []):
-        for c in item.get("content", []):
-            if c.get("type") == "output_text":
-                out_text += c.get("text", "")
-    return out_text.strip()
-
-# -----------------------------
-# Fetch content
-# -----------------------------
-def fetch_pib_rss(max_items=12):
-    items = []
-    for rss_url in PIB_RSS_URLS:
-        d = feedparser.parse(rss_url)
-        for e in d.entries[:max_items]:
-            title = clean_text(getattr(e, "title", ""))
-            link = clean_text(getattr(e, "link", ""))
-            summary = clean_text(getattr(e, "summary", "")) if hasattr(e, "summary") else ""
-            if title:
-                items.append({
-                    "source": "PIB",
-                    "title": title,
-                    "link": link,
-                    "snippet": summary[:300]
-                })
-    return items
-
-def scrape_headlines(url: str, source_name: str, max_items=8):
-    """
-    Light scraping: extracts anchor texts that look like headlines.
-    We keep it conservative to avoid junk.
-    """
-    html_text = http_get(url)
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    candidates = []
-    for a in soup.select("a"):
-        txt = clean_text(a.get_text(" "))
-        href = a.get("href") or ""
-        if not txt or len(txt) < 35:
-            continue
-        # skip nav junk
-        if any(x in txt.lower() for x in ["privacy", "terms", "login", "sign up", "cookie"]):
-            continue
-        # keep likely "news" titles
-        candidates.append((txt, href))
-
-    # de-dup
-    seen = set()
+# =========================
+# FETCHERS
+# =========================
+def fetch_rss(url: str, source_name: str, limit: int = 12):
+    feed = feedparser.parse(url)
     out = []
-    for (t, h) in candidates:
-        key = t.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        link = h
-        if link and link.startswith("/"):
-            # build absolute
-            from urllib.parse import urljoin
-            link = urljoin(url, link)
+    for e in feed.entries[:limit]:
+        title = clean_text(getattr(e, "title", ""))
+        link = clean_text(getattr(e, "link", ""))
+        if title:
+            out.append({"source": source_name, "title": title, "url": link})
+    return out
 
-        out.append({
-            "source": source_name,
-            "title": t,
-            "link": link if link else url,
-            "snippet": ""
-        })
-        if len(out) >= max_items:
+def scrape_rbi_press_releases(limit: int = 10):
+    # RBI RSS sometimes shows human-check; scraping PressReleases page is more reliable
+    url = "https://www.rbi.org.in/Scripts/PressReleases.aspx"
+    html_txt = safe_get(url)
+    soup = BeautifulSoup(html_txt, "html.parser")
+
+    out = []
+    # Titles often appear as links in list
+    for a in soup.select("a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        if not href:
+            continue
+        if "Scripts/BS_PressReleaseDisplay.aspx" in href or "PressReleaseDisplay.aspx" in href:
+            full = href if href.startswith("http") else "https://www.rbi.org.in/" + href.lstrip("/")
+            if text and len(text) > 8:
+                out.append({"source": "RBI", "title": text, "url": full})
+        if len(out) >= limit:
             break
     return out
 
-def fetch_all_items():
-    items = []
-    # PIB RSS
-    try:
-        items += fetch_pib_rss()
-        log(f"Fetched {len(items)} items from PIB RSS")
-    except Exception as e:
-        log(f"PIB RSS fetch failed: {e}")
+def scrape_prs_billtrack(limit: int = 10):
+    url = "https://prsindia.org/billtrack"
+    html_txt = safe_get(url)
+    soup = BeautifulSoup(html_txt, "html.parser")
 
-    # Scrape other sites
-    for name, url in SCRAPE_SOURCES.items():
-        try:
-            scraped = scrape_headlines(url, name, max_items=8)
-            items += scraped
-            log(f"Fetched {len(scraped)} items from {name}")
-        except Exception as e:
-            log(f"Scrape failed for {name}: {e}")
-
-    # final cleanup and cap
-    # remove extremely similar duplicates
-    uniq = []
-    seen = set()
-    for it in items:
-        k = (it["source"], it["title"].lower())
-        if k in seen:
+    out = []
+    # Bill titles are usually in headings/links
+    for a in soup.select("a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        if not href or not text:
             continue
-        seen.add(k)
-        uniq.append(it)
-    return uniq[:35]
+        # avoid navigation items; keep meaningful titles
+        if len(text) < 12:
+            continue
+        if "/billtrack/" in href or "/billtrack" in href:
+            full = href if href.startswith("http") else "https://prsindia.org" + href
+            out.append({"source": "PRS", "title": text, "url": full})
+        if len(out) >= limit:
+            break
+    return out
 
-# -----------------------------
-# Prompt building
-# -----------------------------
-def build_agent_prompt(items: list) -> str:
+def scrape_insights_current_affairs(limit: int = 10):
+    url = "https://www.insightsonindia.com/current-affairs-upsc/"
+    html_txt = safe_get(url)
+    soup = BeautifulSoup(html_txt, "html.parser")
+
+    out = []
+    # pick article links (common pattern: entry-title or h2 a)
+    for a in soup.select("h2 a, h3 a, .entry-title a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        if text and href and len(text) > 12:
+            out.append({"source": "Insights", "title": text, "url": href})
+        if len(out) >= limit:
+            break
+    return out
+
+def scrape_pwonlyias_current_affairs(limit: int = 10):
+    url = "https://pwonlyias.com/current-affairs/"
+    html_txt = safe_get(url)
+    soup = BeautifulSoup(html_txt, "html.parser")
+
+    out = []
+    # pick article links (common patterns)
+    for a in soup.select("h2 a, h3 a, .elementor-post__title a, a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        if not href or not text:
+            continue
+        # keep only internal current-affairs posts, avoid menu links
+        if "pwonlyias.com" in href and "current-affairs" in href and len(text) > 12:
+            out.append({"source": "PWOnlyIAS", "title": text, "url": href})
+        if len(out) >= limit:
+            break
+    # dedupe because this site can repeat anchors
+    return uniq_by_title(out)[:limit]
+
+def fetch_all_headlines():
+    items = []
+
+    # PIB (RSS)
+    for u in PIB_RSS_URLS:
+        try:
+            items += fetch_rss(u, "PIB", limit=12)
+        except Exception:
+            pass
+
+    # RBI (scrape)
+    try:
+        items += scrape_rbi_press_releases(limit=10)
+    except Exception:
+        pass
+
+    # PRS (scrape)
+    try:
+        items += scrape_prs_billtrack(limit=10)
+    except Exception:
+        pass
+
+    # Insights (scrape)
+    try:
+        items += scrape_insights_current_affairs(limit=10)
+    except Exception:
+        pass
+
+    # PWOnlyIAS (scrape)
+    try:
+        items += scrape_pwonlyias_current_affairs(limit=10)
+    except Exception:
+        pass
+
+    items = uniq_by_title(items)
+    random.shuffle(items)
+    return items[:MAX_HEADLINES_TOTAL]
+
+# =========================
+# OPENAI (Responses API)
+# =========================
+def openai_generate_structured(headlines):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing in environment variables.")
+
     today = datetime.now().strftime("%d %b %Y")
-    items_txt = "\n".join(
-        [f"- [{x['source']}] {x['title']} ({x['link']})" for x in items]
+    headlines_txt = "\n".join([f"- ({h['source']}) {h['title']}" for h in headlines])
+
+    system = (
+        "You are an UPSC Current Affairs content generator.\n"
+        "Rules:\n"
+        "1) Use ONLY the provided headlines. Do NOT add extra facts beyond what is implied by the headline.\n"
+        "2) Create output in STRICT JSON only (no markdown, no commentary).\n"
+        "3) Difficulty of MCQs: moderate.\n"
+        "4) MCQs must be answerable from headline understanding + common static concept, but do not invent factual details.\n"
+        "5) 10 MCQs exactly. 2 mains exactly with model answers.\n"
+        "6) DCA must be multiple items (at least 5) and each DCA item must have exactly 5 bullet points.\n"
+        "7) Each MCQ must have exactly 4 options. Provide correct_index 0-3. Provide a short explanation.\n"
     )
 
-    return f"""
-You are a UPSC DCA content engine for Telegram.
+    user = f"""
+Date: {today}
 
-DATE: {today}
-DIFFICULTY: {DIFFICULTY}
+HEADLINES (ONLY SOURCE OF TRUTH):
+{headlines_txt}
 
-INPUT: "Today's headlines" below. You must generate content STRICTLY from these items only.
-If a fact is not supported by a headline, do NOT invent it.
+Return JSON with this schema:
 
-TODAY'S HEADLINES:
-{items_txt}
-
-OUTPUT FORMAT (return valid JSON only, no markdown):
 {{
   "dca": [
     {{
-      "topic": "DCA 1 - <short topic>",
-      "points": ["point 1", "point 2", "point 3", "point 4", "point 5"]
-    }},
-    {{
-      "topic": "DCA 2 - <short topic>",
-      "points": ["point 1", "point 2", "point 3", "point 4", "point 5"]
+      "topic": "DCA 1 - <short topic title>",
+      "bullets": ["1..","2..","3..","4..","5.."]
     }}
   ],
-  "mcq_polls": [
+  "mcqs": [
     {{
       "question": "Q1 ...?",
-      "options": ["A", "B", "C", "D"],
+      "options": ["A","B","C","D"],
       "correct_index": 0,
-      "explanation": "Short explanation based only on the headlines."
+      "explanation": "1-2 lines"
     }}
   ],
   "mains": [
     {{
-      "question": "Mains Q1 (GS?): ...",
-      "answer": "Structured answer: Intro + Body (3-5 bullets) + Conclusion"
-    }},
-    {{
-      "question": "Mains Q2 (GS?): ...",
-      "answer": "Structured answer: Intro + Body (3-5 bullets) + Conclusion"
+      "question": "GSx: ...",
+      "answer": "Intro (2-3 lines)\\nBody (5-7 bullets)\\nConclusion (2 lines)"
     }}
   ]
 }}
+""".strip()
 
-RULES:
-- Create EXACTLY {NUM_POLLS} mcq_polls with 4 options each.
-- Create EXACTLY {NUM_MAINS} mains questions with answers.
-- DCA: Create 2 to 4 DCA topics. Each topic must have exactly 5 bullet points.
-- Questions must be short enough for Telegram polls.
-- Options must be short (prefer <= 8 words).
-- Keep explanations crisp (2-4 lines).
-"""
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.4,
+    }
 
-def parse_json_strict(s: str) -> dict:
-    # try direct
+    r = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=90,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    # Extract text output
+    text = ""
+    for item in data.get("output", []):
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                text += c.get("text", "")
+
+    text = text.strip()
+    # Sometimes model returns extra whitespace; force JSON parse
     try:
-        return json.loads(s)
+        return json.loads(text)
     except Exception:
-        # try extract first JSON object
-        m = re.search(r"\{.*\}", s, re.S)
+        # Attempt to salvage JSON
+        m = re.search(r"\{.*\}", text, flags=re.S)
         if not m:
-            raise
+            raise RuntimeError("OpenAI did not return JSON.")
         return json.loads(m.group(0))
 
-# -----------------------------
-# Rendering to Telegram
-# -----------------------------
-def post_dca(dca_list):
-    today = datetime.now().strftime("%d %b %Y")
-    header = f"🗞️ UPSC DCA ({today})"
-    tg_send_message(header)
+# =========================
+# TELEGRAM API
+# =========================
+def tg_api(method: str, payload: dict):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    r = requests.post(url, json=payload, timeout=30)
+    # Helpful debug:
+    if r.status_code >= 400:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+    return r.json()
 
-    for i, blk in enumerate(dca_list, start=1):
-        topic = clean_text(blk.get("topic", f"DCA {i}"))
-        points = blk.get("points", [])[:5]
-        points = [clean_text(p) for p in points]
-        msg = f"✅ {topic}\n" + "\n".join([f"{j+1}. {points[j]}" for j in range(min(5, len(points)))])
-        tg_send_message(msg)
-        time.sleep(0.8)
+def tg_send_message(text: str):
+    # split long messages
+    text = clean_text(text)
+    chunks = []
+    while len(text) > TG_MSG_MAX:
+        cut = text.rfind("\n", 0, TG_MSG_MAX)
+        if cut < 500:
+            cut = TG_MSG_MAX
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        chunks.append(text)
 
-def post_polls(mcq_polls):
-    tg_send_message(f"🟩 MCQ POLLS ({DIFFICULTY.title()}) — Answer in polls, explanation after each poll.")
-    for idx, q in enumerate(mcq_polls, start=1):
-        question = clean_text(q.get("question", f"Q{idx}?"))
-        options = q.get("options", ["A", "B", "C", "D"])
-        correct_index = int(q.get("correct_index", 0))
-        expl = clean_text(q.get("explanation", ""))
+    for ch in chunks:
+        tg_api("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": ch
+        })
+        time.sleep(0.7)
 
-        # Prefix question number (keep short)
-        poll_q = f"Q{idx}. {question}"
-        # Safety truncation is inside tg_send_poll()
-        tg_send_poll(poll_q, options, correct_index)
-        time.sleep(1.2)
+def tg_send_quiz_poll(question: str, options: list, correct_index: int):
+    # Enforce Telegram poll constraints
+    q = clip(question, TG_POLL_Q_MAX)
+    opts = [clip(o, TG_POLL_OPT_MAX) for o in options][:TG_POLL_MAX_OPTIONS]
+    if len(opts) < 2:
+        raise RuntimeError("Poll must have at least 2 options.")
+    if correct_index < 0 or correct_index >= len(opts):
+        correct_index = 0
 
-        if expl:
-            tg_send_message(f"📝 Explanation (Q{idx}): {truncate(expl, TG_POLL_EXPL_MAX)}")
-            time.sleep(0.8)
+    return tg_api("sendPoll", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "question": q,
+        "options": opts,
+        "type": "quiz",
+        "correct_option_id": int(correct_index),
+        "is_anonymous": False
+    })
 
-def post_mains(mains):
-    tg_send_message("🟦 MAINS (2 Questions) — with model answers")
-    for i, m in enumerate(mains, start=1):
-        q = clean_text(m.get("question", f"Mains Q{i}"))
-        a = clean_text(m.get("answer", ""))
-        msg = f"Q{i}. {q}\n\n✅ Answer:\n{a}"
-        tg_send_message(msg)
-        time.sleep(0.8)
+# =========================
+# RENDER OUTPUT FORMAT
+# =========================
+def render_dca_block(dca_items, date_str):
+    lines = []
+    lines.append(f"🇮🇳 UPSC DCA ({date_str})")
+    lines.append("")
+    for i, item in enumerate(dca_items, start=1):
+        topic = item.get("topic", f"DCA {i}")
+        bullets = item.get("bullets", [])
+        lines.append(f"{i}. {topic}")
+        # Ensure exactly 5 bullets
+        bullets = (bullets + [""] * 5)[:5]
+        for bi, b in enumerate(bullets, start=1):
+            if not b:
+                b = "—"
+            lines.append(f"   {bi}) {clean_text(b)}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
-# -----------------------------
-# Main
-# -----------------------------
+def render_mains_block(mains_items):
+    lines = []
+    lines.append("📝 MAINS (2 Questions + Model Answers)")
+    lines.append("")
+    for i, m in enumerate(mains_items, start=1):
+        q = clean_text(m.get("question", f"Q{i}"))
+        ans = m.get("answer", "")
+        lines.append(f"Q{i}. {q}")
+        lines.append(clean_text(ans))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+# =========================
+# MAIN
+# =========================
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing.")
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Render env vars.")
 
-    log("Fetching today's headlines...")
-    items = fetch_all_items()
-    if not items:
-        tg_send_message("⚠️ No headlines fetched today. Check RSS URLs/site access.")
-        raise RuntimeError("No headlines fetched. Check RSS URLs or site access.")
+    print("INFO | Fetching today's headlines...")
+    headlines = fetch_all_headlines()
 
-    # Build prompt and call model
-    prompt = build_agent_prompt(items)
-    log("Calling OpenAI...")
-    raw = openai_responses(prompt)
-    data = parse_json_strict(raw)
+    if not headlines:
+        # Do NOT crash the cronjob; just notify in Telegram
+        tg_send_message("⚠️ UPSC DCA Bot: No headlines fetched today. Please check sources / site access.")
+        return
 
-    dca = data.get("dca", [])
-    polls = data.get("mcq_polls", [])
-    mains = data.get("mains", [])
+    # Generate structured content
+    content = openai_generate_structured(headlines)
 
-    # Guardrails
-    if not dca:
-        raise RuntimeError("Model returned empty DCA.")
-    if len(polls) < NUM_POLLS:
-        raise RuntimeError(f"Model returned {len(polls)} polls; expected {NUM_POLLS}.")
-    if len(mains) < NUM_MAINS:
-        raise RuntimeError(f"Model returned {len(mains)} mains; expected {NUM_MAINS}.")
+    # Validate fields
+    dca = content.get("dca", [])
+    mcqs = content.get("mcqs", [])
+    mains = content.get("mains", [])
 
-    # Post in order
-    post_dca(dca[:4])
-    post_polls(polls[:NUM_POLLS])
-    post_mains(mains[:NUM_MAINS])
+    # Defensive: enforce counts
+    if len(mcqs) < MCQ_COUNT:
+        mcqs = (mcqs + [])[:MCQ_COUNT]
+    mcqs = mcqs[:MCQ_COUNT]
+    mains = mains[:MAINS_COUNT]
 
-    log("Done posting to Telegram.")
+    date_str = datetime.now().strftime("%d %b %Y")
+    dca_msg = render_dca_block(dca, date_str)
+    tg_send_message(dca_msg)
+
+    tg_send_message(f"✅ MCQ POLLS ({DIFFICULTY.title()}) — Answer in polls. Explanation after each poll.")
+
+    # Send 10 polls
+    for idx, q in enumerate(mcqs, start=1):
+        question = q.get("question", f"Q{idx}?")
+        options = q.get("options", ["A", "B", "C", "D"])
+        correct = int(q.get("correct_index", 0))
+        explanation = q.get("explanation", "").strip()
+
+        # Make question short enough + include numbering
+        question = f"Q{idx}. {clean_text(question)}"
+        question = clip(question, TG_POLL_Q_MAX)
+
+        # Fix options to 4
+        if not isinstance(options, list):
+            options = ["A", "B", "C", "D"]
+        options = (options + [""] * 4)[:4]
+        options = [o if o else "—" for o in options]
+
+        tg_send_quiz_poll(question, options, correct)
+        time.sleep(1.0)
+
+        if explanation:
+            tg_send_message(f"🧠 Explanation (Q{idx}): {clip(explanation, 700)}")
+            time.sleep(0.7)
+
+    # Send mains
+    if mains:
+        tg_send_message(render_mains_block(mains))
+    else:
+        tg_send_message("📝 MAINS: Not generated today (model output missing).")
 
 if __name__ == "__main__":
     try:
         main()
+        print("DONE")
     except Exception as e:
-        log("ERROR: " + str(e))
-        log(traceback.format_exc())
-        # try to notify on Telegram (best effort)
+        # Don't hide errors; send in Telegram + logs
+        err = f"❌ UPSC DCA Bot failed: {type(e).__name__}: {e}"
+        print(err)
+        print(traceback.format_exc())
         try:
-            tg_send_message("❌ Agent failed. Check Render logs.\n" + truncate(str(e), 1000))
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                tg_send_message(err)
         except Exception:
             pass
         raise
