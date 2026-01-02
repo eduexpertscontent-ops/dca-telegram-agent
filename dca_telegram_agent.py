@@ -1,29 +1,37 @@
 import os
 import re
-import sqlite3
+import json
 import logging
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+
 from telegram import Update, Poll
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ---------------- CONFIG ----------------
+from openai import OpenAI
+
+
+# ================== CONFIG ==================
 IST = ZoneInfo("Asia/Kolkata")
 
+AFFAIRSCLOUD_URL = "https://affairscloud.com/current-affairs/"
+ADDA247_URL = "https://currentaffairs.adda247.com/"
+
+# Public channel username (you set via env)
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@UPPCSSUCCESS").strip()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()   # public channel: "@YourChannelUsername"
+
+# OpenAI key is read automatically from OPENAI_API_KEY env by SDK
+client = OpenAI()
+
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2").strip()
 MCQ_COUNT = int(os.getenv("MCQ_COUNT", "10"))
-
-DB_PATH = os.getenv("DB_PATH", "dca_poll_bot.db")
-
-ADDA_HUB = "https://currentaffairs.adda247.com/current-affairs-quiz/"
-AFFAIRSCLOUD_HUB = "https://affairscloud.com/current-affairs-quiz/"
 
 REQ_TIMEOUT = 25
 USER_AGENT = (
@@ -35,78 +43,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("dca-quiz-poll-bot")
 
 
-# ---------------- DATA ----------------
+# ================== DATA ==================
 @dataclass
 class MCQ:
     question: str
     options: List[str]      # 4 options
     correct_index: int      # 0..3
-    explanation: str        # short for quiz poll
-    source_url: str
+    explanation: str        # short for Telegram quiz poll
+    source: str             # short source label
 
 
-# ---------------- DB ----------------
-def db_init() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS posted_urls (
-                url TEXT PRIMARY KEY,
-                posted_at TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-
-
-def db_is_posted(url: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM posted_urls WHERE url = ? LIMIT 1", (url,))
-        return cur.fetchone() is not None
-
-
-def db_mark_posted(url: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO posted_urls(url, posted_at) VALUES(?, ?)",
-            (url, dt.datetime.now(IST).isoformat())
-        )
-        conn.commit()
-
-
-# ---------------- HELPERS ----------------
-def get_html(url: str) -> str:
+# ================== HELPERS ==================
+def http_get(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQ_TIMEOUT)
     r.raise_for_status()
     return r.text
 
 
 def clean_space(s: str) -> str:
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"\s+", " ", s)
     return s.strip()
 
 
 def shorten_chars(text: str, max_chars: int) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
+    text = clean_space(text)
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "…"
 
 
-def safe_question(text: str) -> str:
-    # Poll question limit ~300 chars
-    return shorten_chars(text, 290)
+def safe_poll_question(q: str) -> str:
+    # Telegram poll question limit ~300 chars
+    return shorten_chars(q, 290)
 
 
-def safe_option(text: str) -> str:
-    return shorten_chars(text, 95)
+def safe_poll_option(o: str) -> str:
+    return shorten_chars(o, 95)
 
 
-def safe_explanation(text: str) -> str:
-    # Quiz poll explanation limit is small; keep below ~200 chars
-    return shorten_chars(text, 190)
+def safe_poll_expl(e: str) -> str:
+    # Telegram quiz poll explanation is short; keep well under 200 chars
+    return shorten_chars(e, 190)
 
 
 def dedup_preserve(items: List[str]) -> List[str]:
@@ -119,179 +96,191 @@ def dedup_preserve(items: List[str]) -> List[str]:
     return out
 
 
-def extract_links(html: str, must_contain_any: Tuple[str, ...]) -> List[str]:
+def is_probable_post_url(domain: str, url: str) -> bool:
+    if not url.startswith("http"):
+        return False
+    if domain not in url:
+        return False
+    bad_parts = [
+        "/category/", "/tag/", "/author/", "/page/", "#", "?amp", "/wp-json", "/feed"
+    ]
+    if any(bp in url for bp in bad_parts):
+        return False
+    return True
+
+
+# ================== SCRAPING: GET LATEST POST LINKS ==================
+def extract_post_links_affairscloud(html: str, limit: int = 10) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
     urls = []
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
-        if not href.startswith("http"):
-            continue
-        if any(key in href for key in must_contain_any):
+        # AffairsCloud post slugs often include "current-affairs-" (common pattern)
+        if "affairscloud.com" in href and "current-affairs-" in href and is_probable_post_url("affairscloud.com", href):
             urls.append(href.split("#")[0])
-    return dedup_preserve(urls)
+    return dedup_preserve(urls)[:limit]
 
 
-# ---------------- DISCOVERY ----------------
-def find_adda_quiz_urls(limit: int = 6) -> List[str]:
-    html = get_html(ADDA_HUB)
-    # Adda uses multiple quiz slugs over time
-    return extract_links(html, ("daily-current-affairs-quiz", "latest-daily-current-affairs-quiz"))[:limit]
-
-
-def find_affairscloud_quiz_urls(limit: int = 6) -> List[str]:
-    html = get_html(AFFAIRSCLOUD_HUB)
-    return extract_links(html, ("current-affairs-quiz-",))[:limit]
-
-
-# ---------------- PARSERS ----------------
-def parse_adda_quiz_page(url: str) -> List[MCQ]:
-    html = get_html(url)
+def extract_post_links_adda(html: str, limit: int = 10) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
-    content = soup.select_one(".entry-content") or soup.select_one("article") or soup
-    text = clean_space(content.get_text("\n", strip=True))
-
-    blocks = re.split(r"\n(?=Q\d+\.)", text)
-    out: List[MCQ] = []
-
-    for b in blocks:
-        b = b.strip()
-        if not re.match(r"^Q\d+\.", b):
-            continue
-
-        q = re.sub(r"^Q\d+\.\s*", "", b.splitlines()[0]).strip()
-
-        opts = []
-        for L in ["A", "B", "C", "D"]:
-            m = re.search(rf"\(\s*{L}\s*\)\.?\s*(.+)", b)
-            if m:
-                opts.append(m.group(1).strip())
-        if len(opts) != 4:
-            continue
-
-        ans_m = re.search(r"Answer:\s*([a-dA-D])", b)
-        if not ans_m:
-            continue
-        correct_index = "ABCD".index(ans_m.group(1).upper())
-
-        expl = ""
-        expl_m = re.search(r"Explanation:\s*(.+)", b, flags=re.DOTALL)
-        if expl_m:
-            expl_raw = expl_m.group(1)
-            expl_raw = re.split(r"\nInformation Booster|\nQ\d+\.", expl_raw)[0]
-            expl = clean_space(expl_raw)
-
-        if not expl:
-            expl = "Based on the related current affairs update."
-
-        out.append(MCQ(
-            question=safe_question(q),
-            options=[safe_option(x) for x in opts],
-            correct_index=correct_index,
-            explanation=safe_explanation(expl),
-            source_url=url
-        ))
-
-    return out
+    urls = []
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        # Keep actual post links, avoid category/tag pages
+        if is_probable_post_url("currentaffairs.adda247.com", href):
+            # many posts live directly under the domain with a slug
+            # exclude the homepage itself
+            if href.rstrip("/") == ADDA247_URL.rstrip("/"):
+                continue
+            urls.append(href.split("#")[0])
+    return dedup_preserve(urls)[:limit]
 
 
-def parse_affairscloud_quiz_page(url: str) -> List[MCQ]:
-    html = get_html(url)
+def fetch_article_text(url: str, max_chars: int = 1400) -> Tuple[str, str]:
+    """
+    Returns: (title, summary_text)
+    """
+    html = http_get(url)
     soup = BeautifulSoup(html, "lxml")
-    content = soup.select_one(".entry-content") or soup.select_one("article") or soup
-    text = clean_space(content.get_text("\n", strip=True))
 
-    # Normalize "a) option" -> "(A) option"
-    text = re.sub(r"^\s*([a-dA-D])[\).\]]\s*", r"(\1) ", text, flags=re.MULTILINE)
+    # title
+    title = ""
+    if soup.title and soup.title.get_text(strip=True):
+        title = soup.title.get_text(strip=True)
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = h1.get_text(strip=True)
 
-    blocks = re.split(r"\n(?=Q\d+[\.\)])", text)
-    out: List[MCQ] = []
+    # main content best-effort
+    main = soup.select_one(".entry-content") or soup.select_one("article") or soup.body
+    text = main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True)
 
-    for b in blocks:
-        b = b.strip()
-        if not re.match(r"^Q\d+[\.\)]", b):
-            continue
+    text = clean_space(text)
+    text = shorten_chars(text, max_chars)
 
-        first_line = b.splitlines()[0]
-        q = re.sub(r"^Q\d+[\.\)]\s*", "", first_line).strip()
-
-        opts_map = {}
-        for L in ["A", "B", "C", "D"]:
-            m = re.search(rf"\(\s*{L}\s*\)\s*(.+)", b)
-            if m:
-                opts_map[L] = m.group(1).strip()
-        if len(opts_map) != 4:
-            continue
-
-        ans_m = re.search(r"(Ans|Answer)\s*[:\-]\s*([a-dA-D])", b)
-        if not ans_m:
-            continue
-        correct_index = "ABCD".index(ans_m.group(2).upper())
-
-        expl = ""
-        expl_m = re.search(r"Explanation\s*[:\-]\s*(.+)", b, flags=re.DOTALL)
-        if expl_m:
-            expl = clean_space(expl_m.group(1))
-            expl = re.split(r"\nQ\d+[\.\)]", expl)[0].strip()
-        if not expl:
-            expl = "Refer to the linked quiz page for full context."
-
-        opts = [opts_map["A"], opts_map["B"], opts_map["C"], opts_map["D"]]
-        out.append(MCQ(
-            question=safe_question(q),
-            options=[safe_option(x) for x in opts],
-            correct_index=correct_index,
-            explanation=safe_explanation(expl),
-            source_url=url
-        ))
-
-    return out
+    return shorten_chars(title, 120), text
 
 
-# ---------------- COLLECTION ----------------
-def collect_mcqs(target: int) -> Tuple[List[MCQ], List[str]]:
+def build_source_digest() -> str:
+    """
+    Fetches a handful of latest posts from both sites and builds a compact digest
+    for the model to generate MCQs from.
+    """
+    digest_parts = []
+
+    # AffairsCloud
+    try:
+        ac_html = http_get(AFFAIRSCLOUD_URL)
+        ac_links = extract_post_links_affairscloud(ac_html, limit=7)
+        ac_items = []
+        for url in ac_links[:5]:
+            try:
+                t, body = fetch_article_text(url, max_chars=900)
+                ac_items.append(f"- Title: {t}\n  Key text: {body}\n  Link: {url}")
+            except Exception as e:
+                log.warning("AffairsCloud article fetch failed: %s (%s)", url, e)
+        if ac_items:
+            digest_parts.append("SOURCE 1 (AffairsCloud current affairs):\n" + "\n".join(ac_items))
+    except Exception as e:
+        log.warning("AffairsCloud scrape failed: %s", e)
+
+    # Adda247
+    try:
+        adda_html = http_get(ADDA247_URL)
+        adda_links = extract_post_links_adda(adda_html, limit=10)
+        adda_items = []
+        for url in adda_links[:5]:
+            try:
+                t, body = fetch_article_text(url, max_chars=900)
+                adda_items.append(f"- Title: {t}\n  Key text: {body}\n  Link: {url}")
+            except Exception as e:
+                log.warning("Adda article fetch failed: %s (%s)", url, e)
+        if adda_items:
+            digest_parts.append("SOURCE 2 (Adda247 current affairs):\n" + "\n".join(adda_items))
+    except Exception as e:
+        log.warning("Adda247 scrape failed: %s", e)
+
+    if not digest_parts:
+        # fallback minimal prompt if scraping fails
+        return "No source text could be fetched right now. Create general current affairs MCQs."
+
+    return "\n\n".join(digest_parts)
+
+
+# ================== OPENAI: GENERATE MCQS (Option 1) ==================
+def extract_json_array(text: str) -> str:
+    """
+    If model returns extra text, try to extract the first JSON array.
+    """
+    text = text.strip()
+    # direct JSON array
+    if text.startswith("[") and text.endswith("]"):
+        return text
+    # find first [...] block
+    m = re.search(r"\[[\s\S]*\]", text)
+    if m:
+        return m.group(0)
+    raise ValueError("Could not extract JSON array from model output.")
+
+
+def generate_mcqs_from_digest(digest: str, n: int = 10) -> List[MCQ]:
+    prompt = f"""
+You are an exam content creator for UPPSC/competitive exams.
+
+Using ONLY the factual information in the SOURCES below, create exactly {n} MCQs.
+
+Output MUST be ONLY a valid JSON array (no markdown, no extra text).
+
+Each JSON item must have:
+- "question": string (max 250 chars)
+- "options": array of exactly 4 strings
+- "correct_index": integer 0-3
+- "explanation": string (max 180 chars; crisp, factual)
+- "source": string (either "AffairsCloud" or "Adda247")
+
+Rules:
+- No hallucinations. If a fact is not present in the sources, do not use it.
+- Avoid ultra-specific numbers/dates unless clearly present in sources.
+- Make options plausible, but only one correct.
+- Explanations must be short.
+
+SOURCES:
+{digest}
+""".strip()
+
+    # OPTION 1: plain string input (no content[].type) — this avoids your earlier error
+    resp = client.responses.create(
+        model=MODEL,
+        input=prompt
+    )
+
+    raw = resp.output_text.strip()
+    json_text = extract_json_array(raw)
+    data = json.loads(json_text)
+
     mcqs: List[MCQ] = []
-    used_sources: List[str] = []
+    for item in data:
+        q = safe_poll_question(str(item["question"]))
+        opts = [safe_poll_option(x) for x in item["options"]]
+        ci = int(item["correct_index"])
+        expl = safe_poll_expl(str(item["explanation"]))
+        src = shorten_chars(str(item.get("source", "")), 20) or "Source"
 
-    # 1) Adda247 first
-    for url in find_adda_quiz_urls():
-        if db_is_posted(url):
+        if len(opts) != 4 or not (0 <= ci <= 3):
             continue
-        try:
-            items = parse_adda_quiz_page(url)
-            if items:
-                mcqs.extend(items)
-                used_sources.append(url)
-                db_mark_posted(url)
-        except Exception as e:
-            log.warning("Adda parse failed (%s): %s", url, e)
-        if len(mcqs) >= target:
-            return mcqs[:target], used_sources
 
-    # 2) AffairsCloud fallback
-    for url in find_affairscloud_quiz_urls():
-        if db_is_posted(url):
-            continue
-        try:
-            items = parse_affairscloud_quiz_page(url)
-            if items:
-                mcqs.extend(items)
-                used_sources.append(url)
-                db_mark_posted(url)
-        except Exception as e:
-            log.warning("AffairsCloud parse failed (%s): %s", url, e)
-        if len(mcqs) >= target:
-            break
+        mcqs.append(MCQ(question=q, options=opts, correct_index=ci, explanation=expl, source=src))
 
-    return mcqs[:target], used_sources
+    return mcqs[:n]
 
 
-# ---------------- SENDER ----------------
-async def post_daily_mcqs(context: ContextTypes.DEFAULT_TYPE) -> None:
-    db_init()
+# ================== TELEGRAM: POST QUIZ POLLS ==================
+async def post_mcqs_to_channel(context: ContextTypes.DEFAULT_TYPE) -> None:
+    digest = build_source_digest()
+    mcqs = generate_mcqs_from_digest(digest, n=MCQ_COUNT)
 
-    mcqs, sources = collect_mcqs(MCQ_COUNT)
     if not mcqs:
-        await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Could not fetch MCQs today.")
+        await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Could not generate MCQs today.")
         return
 
     today = dt.datetime.now(IST).strftime("%d %b %Y")
@@ -304,10 +293,9 @@ async def post_daily_mcqs(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     import asyncio
     for i, mcq in enumerate(mcqs, 1):
-        # Small label message (optional)
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"🧠 *MCQ #{i}*",
+            text=f"🧠 *MCQ #{i}*  _(Source: {mcq.source})_",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -324,52 +312,42 @@ async def post_daily_mcqs(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await asyncio.sleep(1.0)  # pacing
 
-    # Send sources used (optional)
-    if sources:
-        msg = "🔗 *Sources used today:*\n" + "\n".join(sources[:5])
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=msg,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True
-        )
 
-
-# ---------------- COMMANDS ----------------
+# ================== COMMANDS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "✅ DCA Quiz Poll Bot is running.\n"
-        "Commands:\n"
-        "/now  -> post today's 10 quiz polls now\n"
+        "✅ Bot is running.\n\n"
+        "Note: Commands won’t work inside a channel.\n"
+        "Use these in my private chat:\n"
+        "/now  -> Post today’s 10 quiz polls now"
     )
 
 
 async def now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Posting quiz polls now…")
-    await post_daily_mcqs(context)
+    await update.message.reply_text("Posting quiz polls to channel now…")
+    await post_mcqs_to_channel(context)
 
 
-# ---------------- MAIN ----------------
+# ================== MAIN ==================
 def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
+        raise SystemExit("ERROR: Set TELEGRAM_BOT_TOKEN env var.")
     if not CHAT_ID:
-        raise SystemExit('Set TELEGRAM_CHAT_ID env var (e.g., "@YourPublicChannel").')
-
-    db_init()
+        raise SystemExit('ERROR: Set TELEGRAM_CHAT_ID env var (e.g., "@UPPCSSUCCESS").')
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("now", now_cmd))
 
     # Daily schedule at 10:00 AM IST
     app.job_queue.run_daily(
-        post_daily_mcqs,
+        post_mcqs_to_channel,
         time=dt.time(hour=10, minute=0, tzinfo=IST),
         name="daily_quiz_polls_10am_ist"
     )
 
-    log.info("Bot started for public channel %s. Scheduled 10:00 IST daily.", CHAT_ID)
+    log.info("Bot started. Posting daily at 10:00 IST to %s", CHAT_ID)
     app.run_polling(close_loop=False)
 
 
