@@ -48,25 +48,60 @@ SCHEMA = {
     "required": ["date", "mcqs"],
     "additionalProperties": False,
 }
+def _norm_q(s: str) -> str:
+    return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
 
-def generate_mcqs() -> dict:
-    today = dt.datetime.utcnow().date().isoformat()
+def _dedupe_keep_order(mcqs):
+    seen = set()
+    out = []
+    for q in mcqs:
+        key = _norm_q(q["question"])
+        if key not in seen:
+            seen.add(key)
+            out.append(q)
+    return out
+
+def _schema_for_n(n: int) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string"},
+            "mcqs": {
+                "type": "array",
+                "minItems": n,
+                "maxItems": n,
+                "items": SCHEMA["properties"]["mcqs"]["items"],
+            },
+        },
+        "required": ["date", "mcqs"],
+        "additionalProperties": False,
+    }
+
+def _generate_n_mcqs(n: int, avoid_questions):
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
 
     system = (
         "You create DAILY current affairs MCQs for competitive exams in ENGLISH.\n"
         "Use web search and prefer facts from the last 24–48 hours.\n"
-        "Return EXACTLY 10 MCQs.\n"
-        "Each MCQ must have exactly 4 options.\n"
-        "Avoid ambiguous or opinion-based questions.\n"
-        "Keep explanations <= 200 characters.\n"
-        "Make questions short, clear, exam-relevant.\n"
+        "ABSOLUTE RULES:\n"
+        "- Do NOT repeat the same event/headline/topic across questions.\n"
+        "- Do NOT repeat question stems or near-duplicates.\n"
+        f"- Generate EXACTLY {n} MCQs, each with exactly 4 options.\n"
+        "- One and only one correct option.\n"
+        "- Keep explanations <= 200 characters.\n"
     )
 
+    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:50]])
+
     user = (
-        f"Create 10 current affairs MCQs for date {today}.\n"
-        "Mix topics: India, World, Economy/Banking, Science/Tech, Defence, Environment, Sports, Awards.\n"
-        "Ensure only one correct option and correct_option_id matches it."
+        f"Create {n} UNIQUE current affairs MCQs for date {today}. "
+        "Mix: India, World, Economy/Banking, Science/Tech, Defence, Environment, Sports, Awards.\n"
+        "Avoid duplicating ANY of these existing questions:\n"
+        f"{avoid_block}\n"
+        "Return JSON exactly as per schema."
     )
+
+    schema = _schema_for_n(n)
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
@@ -75,16 +110,28 @@ def generate_mcqs() -> dict:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "daily_ca_mcqs",
-                "strict": True,
-                "schema": SCHEMA,
-            }
-        },
+        text={"format": {"type": "json_schema", "name": "daily_ca_mcqs_n", "strict": True, "schema": schema}},
     )
     return json.loads(resp.output_text)
+
+def generate_mcqs() -> dict:
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+    base = _generate_n_mcqs(10, avoid_questions=[])
+    unique = _dedupe_keep_order(base["mcqs"])
+
+    tries = 0
+    while len(unique) < 10 and tries < 3:
+        missing = 10 - len(unique)
+        avoid_list = [q["question"] for q in unique]
+        extra = _generate_n_mcqs(missing, avoid_questions=avoid_list)
+        unique = _dedupe_keep_order(unique + extra["mcqs"])
+        tries += 1
+
+    base["date"] = today
+    base["mcqs"] = unique[:10]
+    return base
+
 
 def post_to_channel(mcq_set: dict):
     tg(
