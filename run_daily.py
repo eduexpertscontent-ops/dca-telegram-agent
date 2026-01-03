@@ -95,7 +95,7 @@ def post_to_channel(mcq_set: dict):
 
     for i, q in enumerate(mcq_set["mcqs"], start=1):
         payload = {
-            "chat_id": TELELEGRAM_CHAT_ID if False else TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
             "options": [{"text": opt} for opt in q["options"]],
             "type": "quiz",
