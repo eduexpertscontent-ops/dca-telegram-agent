@@ -3,6 +3,7 @@ import json
 import time
 import datetime as dt
 import requests
+import random
 from openai import OpenAI
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -132,6 +133,23 @@ def generate_mcqs() -> dict:
     base["mcqs"] = unique[:10]
     return base
 
+def shuffle_options_and_fix_answer(q: dict) -> dict:
+    """
+    Shuffles options so correct answer isn't always A.
+    Updates correct_option_id accordingly.
+    """
+    options = q["options"]
+    correct_text = options[q["correct_option_id"]]
+
+    # Shuffle with a stable seed so results are consistent per question/day
+    seed = q["question"] + correct_text
+    rnd = random.Random(seed)
+    shuffled = options[:]
+    rnd.shuffle(shuffled)
+
+    q["options"] = shuffled
+    q["correct_option_id"] = shuffled.index(correct_text)
+    return q
 
 def post_to_channel(mcq_set: dict):
     tg(
@@ -141,6 +159,8 @@ def post_to_channel(mcq_set: dict):
     )
 
     for i, q in enumerate(mcq_set["mcqs"], start=1):
+        q = shuffle_options_and_fix_answer(q)
+
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
