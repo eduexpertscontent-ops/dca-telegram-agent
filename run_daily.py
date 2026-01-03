@@ -30,18 +30,23 @@ SCHEMA = {
             "maxItems": 10,
             "items": {
                 "type": "object",
-                "properties": {
-                    "question": {"type": "string", "minLength": 1, "maxLength": 300},
-                    "options": {
-                        "type": "array",
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
-                    },
-                    "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "explanation": {"type": "string", "maxLength": 200},
+               "properties": {
+    "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
+    "question": {"type": "string", "minLength": 1, "maxLength": 300},
+    "options": {
+        "type": "array",
+        "minItems": 4,
+        "maxItems": 4,
+        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+    },
+    "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
+    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 100},
+    "explanation": {"type": "string", "maxLength": 200},
+},
+
                 },
-                "required": ["question", "options", "correct_option_id", "explanation"],
+                "required": ["event_key", "question", "options", "correct_option_id", "correct_answer", "explanation"],
+
                 "additionalProperties": False,
             },
         },
@@ -85,11 +90,11 @@ def _generate_n_mcqs(n: int, avoid_questions):
         "You create DAILY current affairs MCQs for competitive exams in ENGLISH.\n"
         "Use web search and prefer facts from the last 24–48 hours.\n"
         "ABSOLUTE RULES:\n"
-        "- Do NOT repeat the same event/headline/topic across questions.\n"
-        "- Do NOT repeat question stems or near-duplicates.\n"
-        f"- Generate EXACTLY {n} MCQs, each with exactly 4 options.\n"
-        "- One and only one correct option.\n"
-        "- Keep explanations <= 200 characters.\n"
+       "- Each MCQ must have a UNIQUE event_key (3–8 words). No two MCQs can share the same event_key.\n"
+"- correct_answer must EXACTLY match one of the 4 options.\n"
+"- correct_option_id must be the index of correct_answer in options.\n"
+"- All 4 options must be distinct.\n"
+
     )
 
     avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:50]])
@@ -172,9 +177,35 @@ def post_to_channel(mcq_set: dict):
         }
         tg("sendPoll", payload)
         time.sleep(1)
+def validate_and_fix_mcqs(mcq_set: dict) -> dict:
+    system = (
+        "You are a strict fact-checker for current affairs MCQs.\n"
+        "Verify each MCQ using web search. Fix any incorrect answers/options.\n"
+        "Rules:\n"
+        "- Keep EXACTLY 10 MCQs.\n"
+        "- Keep options as 4.\n"
+        "- correct_answer must match one option exactly.\n"
+        "- correct_option_id must match correct_answer.\n"
+        "- event_key must be unique across all 10.\n"
+        "- Explanations <= 200 chars.\n"
+        "Return JSON only in the same schema."
+    )
+
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        tools=[{"type": "web_search"}],
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Fix and validate this set:\n{json.dumps(mcq_set)}"},
+        ],
+        text={"format": {"type": "json_schema", "name": "validated_mcqs", "strict": True, "schema": SCHEMA}},
+    )
+    return json.loads(resp.output_text)
 
 def main():
     mcq_set = generate_mcqs()
+    mcq_set = validate_and_fix_mcqs(mcq_set)
+
     post_to_channel(mcq_set)
     print("✅ Posted 10 quiz polls successfully.")
 
