@@ -7,10 +7,11 @@ import random
 from openai import OpenAI
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # @UPPCSSUCCESS
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g., @UPPCSSUCCESS
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 client = OpenAI()  # reads OPENAI_API_KEY from environment
+
 
 def tg(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
@@ -19,6 +20,7 @@ def tg(method: str, payload: dict) -> dict:
     if not data.get("ok"):
         raise RuntimeError(f"Telegram error: {data}")
     return data
+
 
 SCHEMA = {
     "type": "object",
@@ -59,8 +61,10 @@ SCHEMA = {
     "additionalProperties": False,
 }
 
+
 def _norm_q(s: str) -> str:
     return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
+
 
 def _dedupe_keep_order(mcqs):
     seen = set()
@@ -71,6 +75,7 @@ def _dedupe_keep_order(mcqs):
             seen.add(key)
             out.append(q)
     return out
+
 
 def _schema_for_n(n: int) -> dict:
     return {
@@ -88,6 +93,7 @@ def _schema_for_n(n: int) -> dict:
         "additionalProperties": False,
     }
 
+
 def _generate_n_mcqs(n: int, avoid_questions):
     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
 
@@ -95,11 +101,10 @@ def _generate_n_mcqs(n: int, avoid_questions):
         "You create DAILY current affairs MCQs for competitive exams in ENGLISH.\n"
         "Use web search and prefer facts from the last 24–48 hours.\n"
         "ABSOLUTE RULES:\n"
-       "- Each MCQ must have a UNIQUE event_key (3–8 words). No two MCQs can share the same event_key.\n"
-"- correct_answer must EXACTLY match one of the 4 options.\n"
-"- correct_option_id must be the index of correct_answer in options.\n"
-"- All 4 options must be distinct.\n"
-
+        "- Each MCQ must have a UNIQUE event_key (3–8 words). No two MCQs can share the same event_key.\n"
+        "- correct_answer must EXACTLY match one of the 4 options.\n"
+        "- correct_option_id must be the index of correct_answer in options.\n"
+        "- All 4 options must be distinct.\n"
     )
 
     avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:50]])
@@ -121,9 +126,17 @@ def _generate_n_mcqs(n: int, avoid_questions):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        text={"format": {"type": "json_schema", "name": "daily_ca_mcqs_n", "strict": True, "schema": schema}},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "daily_ca_mcqs_n",
+                "strict": True,
+                "schema": schema,
+            }
+        },
     )
     return json.loads(resp.output_text)
+
 
 def generate_mcqs() -> dict:
     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -143,6 +156,7 @@ def generate_mcqs() -> dict:
     base["mcqs"] = unique[:10]
     return base
 
+
 def shuffle_options_and_fix_answer(q: dict) -> dict:
     """
     Shuffles options so correct answer isn't always A.
@@ -151,7 +165,6 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
     options = q["options"]
     correct_text = options[q["correct_option_id"]]
 
-    # Shuffle with a stable seed so results are consistent per question/day
     seed = q["question"] + correct_text
     rnd = random.Random(seed)
     shuffled = options[:]
@@ -161,11 +174,14 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
     q["correct_option_id"] = shuffled.index(correct_text)
     return q
 
+
 def post_to_channel(mcq_set: dict):
     tg(
         "sendMessage",
-        {"chat_id": TELEGRAM_CHAT_ID,
-         "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇"}
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇",
+        },
     )
 
     for i, q in enumerate(mcq_set["mcqs"], start=1):
@@ -174,7 +190,7 @@ def post_to_channel(mcq_set: dict):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
-            "options": [{"text": opt} for opt in q["options"]],
+            "options": q["options"],  # ✅ Telegram expects list[str]
             "type": "quiz",
             "correct_option_id": q["correct_option_id"],
             "explanation": q["explanation"],
@@ -182,6 +198,8 @@ def post_to_channel(mcq_set: dict):
         }
         tg("sendPoll", payload)
         time.sleep(1)
+
+
 def validate_and_fix_mcqs(mcq_set: dict) -> dict:
     system = (
         "You are a strict fact-checker for current affairs MCQs.\n"
@@ -203,16 +221,24 @@ def validate_and_fix_mcqs(mcq_set: dict) -> dict:
             {"role": "system", "content": system},
             {"role": "user", "content": f"Fix and validate this set:\n{json.dumps(mcq_set)}"},
         ],
-        text={"format": {"type": "json_schema", "name": "validated_mcqs", "strict": True, "schema": SCHEMA}},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "validated_mcqs",
+                "strict": True,
+                "schema": SCHEMA,
+            }
+        },
     )
     return json.loads(resp.output_text)
+
 
 def main():
     mcq_set = generate_mcqs()
     mcq_set = validate_and_fix_mcqs(mcq_set)
-
     post_to_channel(mcq_set)
     print("✅ Posted 10 quiz polls successfully.")
+
 
 if __name__ == "__main__":
     main()
