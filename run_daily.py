@@ -173,6 +173,43 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
     q["options"] = shuffled
     q["correct_option_id"] = shuffled.index(correct_text)
     return q
+    
+def post_competitive_closure_message():
+    text = (
+        "🏁 *Today’s Challenge Ends Here!*\n\n"
+        "Comment your score below 👇\n"
+        "Let’s see how many *8+ scorers* we have today 🔥\n\n"
+        "⏰ Back tomorrow at the same time."
+    )
+    tg(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        },
+    )
+
+
+def post_score_poll(date_str: str):
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "question": f"📊 Vote your score ({date_str}) ✅\nHow many were correct out of 10?",
+        "options": [
+            "10/10 🏆",
+            "9/10 🔥",
+            "8/10 ✅",
+            "7/10 👍",
+            "6/10 🙂",
+            "5/10 📘",
+            "4/10 🧠",
+            "3 or less 😅",
+        ],
+        "is_anonymous": True,
+        "allows_multiple_answers": False,
+    }
+    tg("sendPoll", payload)
 
 
 def post_to_channel(mcq_set: dict):
@@ -199,6 +236,11 @@ def post_to_channel(mcq_set: dict):
         tg("sendPoll", payload)
         time.sleep(1)
 
+    time.sleep(1)
+    post_competitive_closure_message()
+
+    time.sleep(1)
+    post_score_poll(mcq_set["date"])
 
 def validate_and_fix_mcqs(mcq_set: dict) -> dict:
     system = (
