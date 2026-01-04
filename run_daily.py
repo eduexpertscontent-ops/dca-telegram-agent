@@ -30,23 +30,27 @@ SCHEMA = {
             "maxItems": 10,
             "items": {
                 "type": "object",
-               "properties": {
-    "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
-    "question": {"type": "string", "minLength": 1, "maxLength": 300},
-    "options": {
-        "type": "array",
-        "minItems": 4,
-        "maxItems": 4,
-        "items": {"type": "string", "minLength": 1, "maxLength": 100},
-    },
-    "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
-    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 100},
-    "explanation": {"type": "string", "maxLength": 200},
-},
-
+                "properties": {
+                    "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
+                    "question": {"type": "string", "minLength": 1, "maxLength": 300},
+                    "options": {
+                        "type": "array",
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                    },
+                    "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "explanation": {"type": "string", "maxLength": 200},
                 },
-                "required": ["event_key", "question", "options", "correct_option_id", "correct_answer", "explanation"],
-
+                "required": [
+                    "event_key",
+                    "question",
+                    "options",
+                    "correct_option_id",
+                    "correct_answer",
+                    "explanation",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -54,6 +58,7 @@ SCHEMA = {
     "required": ["date", "mcqs"],
     "additionalProperties": False,
 }
+
 def _norm_q(s: str) -> str:
     return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
 
