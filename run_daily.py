@@ -15,42 +15,57 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g., @UPPCSSUCCESS
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# Keep last N days to avoid repeats across days
 KEEP_LAST_DAYS = int(os.getenv("KEEP_LAST_DAYS", "15"))
+
+# Telegram pacing (helps avoid 429)
 SLEEP_BETWEEN_POLLS = float(os.getenv("SLEEP_BETWEEN_POLLS", "2"))
 SLEEP_AFTER_QUIZ = float(os.getenv("SLEEP_AFTER_QUIZ", "2"))
 
 NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "25"))
-MAX_NEWS_ITEMS = int(os.getenv("MAX_NEWS_ITEMS", "250"))
-CONTEXT_ITEMS = int(os.getenv("CONTEXT_ITEMS", "70"))
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "120"))
+MAX_NEWS_ITEMS = int(os.getenv("MAX_NEWS_ITEMS", "260"))
+CONTEXT_ITEMS = int(os.getenv("CONTEXT_ITEMS", "80"))
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "140"))
 MIN_TODAY_ITEMS_REQUIRED = int(os.getenv("MIN_TODAY_ITEMS_REQUIRED", "18"))
 
 HISTORY_FILE = "mcq_history.json"
 
-client = OpenAI()
+client = OpenAI()  # reads OPENAI_API_KEY from environment
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
 # -------------------- TELEGRAM HELPERS --------------------
 def tg(method: str, payload: dict) -> dict:
+    """
+    Telegram API wrapper with basic retry on rate limits.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     last_err = None
-    for _ in range(4):
+
+    for _ in range(4):  # retry up to 4 times
         r = requests.post(url, json=payload, timeout=30)
         data = r.json()
+
         if data.get("ok"):
             return data
+
         last_err = data
+
+        # Rate limit / flood control
         if data.get("error_code") == 429:
             retry_after = (data.get("parameters") or {}).get("retry_after", 5)
             print(f"⚠️ Telegram rate limit. Retrying after {retry_after}s...")
             time.sleep(int(retry_after) + 1)
             continue
+
+        # Other Telegram errors: raise
         raise RuntimeError(f"Telegram error: {data}")
+
     raise RuntimeError(f"Telegram error after retries: {last_err}")
 
 
-# -------------------- SCHEMA (adds mcq_type + difficulty + source_hint, not posted) --------------------
+# -------------------- JSON SCHEMA (UPSC-level) --------------------
+# Note: Adds mcq_type, difficulty, source_hint to enforce quality; these are NOT posted to Telegram.
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -64,18 +79,18 @@ SCHEMA = {
                 "properties": {
                     "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
                     "mcq_type": {"type": "string", "minLength": 3, "maxLength": 30},
-                    "difficulty": {"type": "string", "enum": ["Easy", "Moderate"]},
+                    "difficulty": {"type": "string", "enum": ["Easy", "Moderate", "Tough"]},
                     "question": {"type": "string", "minLength": 1, "maxLength": 300},
                     "options": {
                         "type": "array",
                         "minItems": 4,
                         "maxItems": 4,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                        "items": {"type": "string", "minLength": 1, "maxLength": 120},
                     },
                     "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 100},
-                    "explanation": {"type": "string", "maxLength": 200},
-                    "source_hint": {"type": "string", "maxLength": 120},
+                    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "explanation": {"type": "string", "maxLength": 220},
+                    "source_hint": {"type": "string", "maxLength": 80},
                 },
                 "required": [
                     "event_key",
@@ -97,8 +112,19 @@ SCHEMA = {
 }
 
 
-# -------------------- HISTORY --------------------
+# -------------------- HISTORY (NO-REPEAT ACROSS DAYS) --------------------
 def load_history() -> dict:
+    """
+    {
+      "dates": {
+        "YYYY-MM-DD": {"questions":[...], "event_keys":[...], "title_norms":[...], "url_hashes":[...]}
+      },
+      "questions":[...],
+      "event_keys":[...],
+      "title_norms":[...],
+      "url_hashes":[...]
+    }
+    """
     if not os.path.exists(HISTORY_FILE):
         return {"dates": {}, "questions": [], "event_keys": [], "title_norms": [], "url_hashes": []}
     try:
@@ -129,11 +155,13 @@ def update_history_with_set(hist: dict, mcq_set: dict, keep_last_days: int, used
         "url_hashes": list(used_url_hashes),
     }
 
+    # prune old dates
     all_dates = sorted(hist["dates"].keys())
     if len(all_dates) > keep_last_days:
         for d in all_dates[:-keep_last_days]:
             hist["dates"].pop(d, None)
 
+    # rebuild flattened lists (bounded)
     qs, eks, tns, uhs = [], [], [], []
     for d in sorted(hist["dates"].keys()):
         qs.extend(hist["dates"][d].get("questions", []))
@@ -141,14 +169,14 @@ def update_history_with_set(hist: dict, mcq_set: dict, keep_last_days: int, used
         tns.extend(hist["dates"][d].get("title_norms", []))
         uhs.extend(hist["dates"][d].get("url_hashes", []))
 
-    hist["questions"] = qs[-600:]
-    hist["event_keys"] = eks[-600:]
-    hist["title_norms"] = tns[-1000:]
-    hist["url_hashes"] = uhs[-1000:]
+    hist["questions"] = qs[-700:]
+    hist["event_keys"] = eks[-700:]
+    hist["title_norms"] = tns[-1200:]
+    hist["url_hashes"] = uhs[-1200:]
     return hist
 
 
-# -------------------- NORMALIZATION --------------------
+# -------------------- NORMALIZATION / DEDUPE --------------------
 def _norm_text(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"\s+", " ", s)
@@ -169,6 +197,10 @@ def _dedupe_keep_order_by_key(items, key_fn):
             seen.add(k)
             out.append(it)
     return out
+
+
+def _norm_q(s: str) -> str:
+    return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
 
 
 # -------------------- RSS FETCH --------------------
@@ -210,27 +242,27 @@ def _parse_rss_items(xml_text: str):
                 "title": title,
                 "link": link,
                 "published_ist": pub_dt,
-                "description": re.sub(r"<.*?>", "", desc)[:240],
+                "description": re.sub(r"<.*?>", "", desc)[:280],
             }
         )
     return items
 
 
-# -------------------- AUTHENTIC SOURCES ONLY --------------------
+# -------------------- SOURCES (UPSC + GOVT EXAM PREP) --------------------
 def fetch_news_pool():
     """
-    ONLY authentic current-affairs / official sources.
-    NOTE: Some sites may not expose RSS reliably; we fail gracefully.
+    Mix of Tier-1 UPSC-friendly + govt-exam-prep CA sites (as requested).
     """
     feeds = [
-        # Official/primary
+        # Tier-1 (UPSC-friendly)
         ("PIB", "https://pib.gov.in/RssMain.aspx?mod=0&ln=1"),
+        ("PRS", "https://prsindia.org/rss.xml"),
+        ("IndianExpress-Explained", "https://indianexpress.com/section/explained/feed/"),
+        ("DownToEarth", "https://www.downtoearth.org.in/rss"),
 
-        # Well-known current affairs sites (RSS/feeds)
+        # Govt-exam-prep CA (your allowed list)
         ("AffairsCloud", "https://affairscloud.com/feed/"),
         ("GKToday", "https://www.gktoday.in/feed/"),
-
-        # Many candidates use these; if a feed fails, it’s okay (no crash)
         ("JagranJosh-CA", "https://www.jagranjosh.com/rss/current-affairs.xml"),
         ("Adda247-CA", "https://www.adda247.com/jobs/feed/"),
     ]
@@ -252,6 +284,7 @@ def fetch_news_pool():
     return all_items
 
 
+# -------------------- FRESHNESS FILTER (IST, SAME DAY) --------------------
 def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
     now_ist = dt.datetime.now(IST)
     today = now_ist.date()
@@ -261,7 +294,7 @@ def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
 
     today_items = [it for it in items if is_today(it)]
 
-    # If too few today items across CA sources, allow last 24h (still fresh)
+    # If too few today items, allow last 24h
     if len(today_items) < MIN_TODAY_ITEMS_REQUIRED:
         cutoff = now_ist - dt.timedelta(hours=24)
         pool = [it for it in items if it.get("published_ist") and it["published_ist"] >= cutoff]
@@ -282,32 +315,67 @@ def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
     return out
 
 
-# -------------------- EXAM RELEVANCY SCORING (POSITIVE-ONLY) --------------------
-# No LOW_VALUE list (as per your instruction). Only positive scoring.
+# -------------------- EXCLUDE BANKING/FINANCE (ALLOW ECONOMY) --------------------
+BANK_FIN_EXCLUDE = [
+    "rbi", "repo", "reverse repo", "crr", "slr", "mclr", "mpc",
+    "nbfc", "banking", "bank ", "banks", "loan", "credit", "debit",
+    "sebi", "irdai", "pfrda", "mutual fund", "ipo", "share market",
+    "bond", "g-sec", "treasury bill", "forex", "rupee hits", "stocks",
+    "upi", "payments", "digital payment", "fintech",
+]
+
+ECON_ALLOWED = [
+    "gdp", "inflation", "cpi", "wpi", "fiscal", "budget", "tax",
+    "gst", "subsidy", "poverty", "employment", "unemployment",
+    "agriculture", "msp", "food security", "trade", "export", "import",
+    "current account", "cad", "imf", "world bank", "economic survey",
+]
+
+def is_banking_finance_item(item: dict) -> bool:
+    txt = (item.get("title","") + " " + item.get("description","")).lower()
+    bank_hit = any(k in txt for k in BANK_FIN_EXCLUDE)
+    econ_hit = any(k in txt for k in ECON_ALLOWED)
+    return bank_hit and not econ_hit
+
+
+# -------------------- UPSC-WORTHINESS FILTER --------------------
+UPSC_CORE_KEYWORDS = [
+    # Polity/Governance/Law
+    "bill", "act", "amendment", "ordinance", "parliament", "supreme court", "high court",
+    "committee", "commission", "tribunal", "authority", "constitution",
+    # Governance/programmes
+    "scheme", "yojana", "mission", "policy", "guidelines", "framework",
+    # Environment/Geo
+    "biodiversity", "wildlife", "tiger reserve", "national park", "wetland", "climate", "pollution",
+    "glacier", "river", "basin", "earthquake", "cyclone",
+    # IR/Summits
+    "g20", "brics", "sco", "cop", "asean", "quad", "un ", "who", "wto",
+    # Economy (non-banking)
+    "gdp", "inflation", "cpi", "fiscal", "budget", "gst", "subsidy", "trade",
+    # Science/Tech (UPSC)
+    "isro", "satellite", "space", "semiconductor", "quantum", "biotech", "genome",
+]
+
+SHALLOW_PATTERNS = [
+    "brand ambassador", "celebrated", "anniversary", "wins", "won the match",
+    "trailer", "box office", "viral", "launched a new app", "opened a new outlet",
+]
+
+def is_upsc_worthy(item: dict) -> bool:
+    txt = (item.get("title","") + " " + item.get("description","")).lower()
+    if any(p in txt for p in SHALLOW_PATTERNS):
+        return False
+    return any(k in txt for k in UPSC_CORE_KEYWORDS)
+
+
+# -------------------- EXAM RELEVANCY SCORING (POSITIVE ONLY) --------------------
 POSITIVE_KEYWORDS = [
-    # Governance/Polity/Schemes
-    "cabinet", "parliament", "bill", "ordinance", "notification", "guidelines", "policy",
-    "scheme", "yojana", "mission", "programme", "initiative",
-    "commission", "authority", "tribunal", "supreme court", "high court",
-
-    # Economy/Banking/Regulation
-    "rbi", "sebi", "irdai", "pfrda", "nabard", "sidbi",
-    "bank", "inflation", "gdp", "budget", "gst", "repo", "crr", "slr", "npa", "upi", "forex",
-
-    # Reports/Indexes/Surveys
-    "report", "index", "ranking", "survey", "census",
-
-    # Defence/S&T/Environment
-    "drdo", "missile", "exercise", "navy", "air force", "army",
-    "isro", "satellite", "space", "ai", "quantum", "semiconductor",
-    "wildlife", "tiger reserve", "national park", "pollution", "climate",
-
-    # International orgs/summits (only when exam-relevant)
-    "summit", "cop", "g20", "brics", "sco", "who", "un", "wto", "imf", "world bank",
-
-    # Appointments/awards (exam-asked)
-    "appointed", "elected", "chairman", "governor", "ceo", "chief",
-    "award",
+    "parliament", "bill", "act", "amendment", "committee", "commission", "tribunal",
+    "scheme", "mission", "policy", "guidelines", "framework",
+    "biodiversity", "wildlife", "wetland", "climate", "pollution",
+    "isro", "satellite", "space", "quantum", "semiconductor", "biotech",
+    "g20", "brics", "sco", "cop", "un", "who", "wto",
+    "gdp", "inflation", "cpi", "fiscal", "budget", "gst", "trade",
 ]
 
 def exam_relevancy_score(item: dict) -> int:
@@ -317,28 +385,31 @@ def exam_relevancy_score(item: dict) -> int:
 
     score = 0
 
-    # Source weighting (official > CA site > general)
     src = (item.get("source") or "").lower()
     if "pib" in src:
+        score += 12
+    elif "prs" in src:
+        score += 12
+    elif "indianexpress-explained" in src:
         score += 10
-    if "affairscloud" in src:
-        score += 6
-    if "gktoday" in src:
-        score += 6
-    if "jagran" in src:
-        score += 4
-    if "adda" in src:
-        score += 4
+    elif "downtoearth" in src:
+        score += 10
+    elif "affairscloud" in src:
+        score += 5
+    elif "gktoday" in src:
+        score += 5
+    elif "jagranjosh" in src:
+        score += 3
+    elif "adda247" in src:
+        score += 3
 
     for kw in POSITIVE_KEYWORDS:
         if kw in text:
             score += 2
 
-    # Slight boost for India context words (without using any blacklist)
     if "india" in text or "indian" in text:
-        score += 2
+        score += 1
 
-    # Prefer informative titles
     if len(title) < 25:
         score -= 1
 
@@ -351,6 +422,7 @@ def rank_news(items):
         it = dict(it)
         it["exam_score"] = exam_relevancy_score(it)
         scored.append(it)
+
     scored.sort(
         key=lambda x: (x.get("exam_score", 0), x.get("published_ist") or dt.datetime.min.replace(tzinfo=IST)),
         reverse=True,
@@ -370,67 +442,88 @@ def build_news_context(items, max_items: int):
     return "\n".join(lines)
 
 
-# -------------------- OPENAI: EXAM-STANDARD FRAMING --------------------
-EXAM_STYLE_RULES = """
-You must frame questions exactly like SSC/Bank/PCS exams.
+# -------------------- OPENAI: UPSC PRELIMS STYLE (NO BANKING/FINANCE) --------------------
+UPSC_STYLE_RULES = """
+You are a UPSC CSE Prelims (GS Paper 1) question setter.
 
-Allowed MCQ TYPES (any mix; no fixed quotas):
-- Direct Fact (who/what/where/when)
-- Statement-based: "Consider the following statements..." (2 statements) ask which are correct
-- Pairing: "Which of the following pairs is/are correctly matched?"
-- Simplified Match (List-I / List-II) as 4 options
+Core philosophy:
+- Test conceptual understanding linked with current affairs.
+- Avoid one-line trivia.
+- Prefer statement-based MCQs.
 
-Exam framing rules (hard):
-1) Start with: "Recently," OR "In the context of current affairs," OR "Which of the following..." OR "Consider the following statements:"
-2) No casual quiz tone, no emojis.
-3) Options must be same category (all persons / all organisations / all places / all schemes / all dates).
-4) Avoid vague stems like "According to a report" unless you name the report (e.g., NFHS, ASER, WEO, etc.).
-5) No opinion questions.
-6) Difficulty only Easy/Moderate.
-7) Explanation must have two parts within 200 chars: (a) current fact, (b) static GK link (definition/role/body).
-8) Use ONLY the given news items. Do not invent.
+Mandatory distribution:
+- At least 7 out of 10 questions MUST be statement-based (2 or 3 statements).
+- Remaining can be: correctly matched pairs, institutions & functions, environment & geography, reports/indices (concept + purpose).
+
+Hard exclusions:
+- NO banking/finance MCQs: RBI/SEBI/IRDAI/PFRDA, repo/CRR/SLR, UPI/payments, banks/NBFCs, stock/IPO/mutual funds.
+- NO sports/entertainment/trivial awards.
+- NO trivial appointments (unless constitutional/major international office).
+
+Statement option format (use exactly this when using 2 statements):
+(a) 1 only
+(b) 2 only
+(c) Both 1 and 2
+(d) Neither 1 nor 2
+
+Other hard rules:
+1) Use ONLY the provided news items. Do not invent facts.
+2) Every MCQ must be based on a DIFFERENT news story.
+3) Make options close/plausible (UPSC-like distractors).
+4) Keep explanation <= 220 chars and include:
+   - Current fact (what happened)
+   - Static concept link (what is it/role/definition)
+5) Use formal UPSC tone (no quiz language).
 """
 
-def generate_mcqs_exam_style(today_str: str, news_context: str, avoid_questions: list, avoid_event_keys: list):
+def generate_mcqs_upsc(today_str: str, news_context: str, avoid_questions: list, avoid_event_keys: list):
     system = (
-        "You are an exam question setter for SSC, Banking exams, and State PCS.\n"
+        "You write UPSC Prelims-quality MCQs in ENGLISH.\n"
         "Use ONLY the provided news list.\n"
-        + EXAM_STYLE_RULES +
+        + UPSC_STYLE_RULES +
         "\nReturn STRICT JSON as per schema."
     )
 
-    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:180]])
-    avoid_keys_block = "\n".join([f"- {a}" for a in (avoid_event_keys or [])[:180]])
+    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:200]])
+    avoid_keys_block = "\n".join([f"- {a}" for a in (avoid_event_keys or [])[:200]])
 
     user = (
         f"DATE (IST): {today_str}\n\n"
         "NEWS ITEMS (use ONLY these):\n"
         f"{news_context}\n\n"
-        "Create EXACTLY 10 MCQs from the MOST exam-relevant items.\n"
-        "- Each MCQ must be from a DIFFERENT news story.\n"
-        "- Do NOT follow any fixed quotas by category.\n\n"
+        "Create EXACTLY 10 UPSC Prelims-quality MCQs.\n"
+        "- Pick the MOST UPSC-relevant items.\n"
+        "- No fixed quotas by topic.\n"
+        "- Ensure India coverage is present naturally if today's items support it.\n\n"
         "AVOID repeating ANY of these prior questions/topics:\n"
         f"{avoid_block}\n\n"
         "AVOID these prior event_keys/topics:\n"
         f"{avoid_keys_block}\n\n"
-        "For each MCQ, include:\n"
-        "- mcq_type (one allowed type)\n"
-        "- difficulty (Easy/Moderate)\n"
-        "- source_hint: just the source label like 'PIB' or 'GKToday' (no URL)\n"
+        "For each MCQ also include:\n"
+        "- mcq_type (e.g., Statement-based / Correct match / Institution / Environment / Report)\n"
+        "- difficulty (Easy/Moderate/Tough)\n"
+        "- source_hint (just source label like PIB/PRS/GKToday etc.)\n"
     )
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
         input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        text={"format": {"type": "json_schema", "name": "daily_ca_mcqs_examstyle", "strict": True, "schema": SCHEMA}},
+        text={"format": {"type": "json_schema", "name": "daily_upsc_mcqs", "strict": True, "schema": SCHEMA}},
     )
     return json.loads(resp.output_text)
 
 
-# -------------------- QUALITY FILTERS --------------------
-def looks_exam_style(q: dict) -> bool:
+# -------------------- QUALITY CHECKS --------------------
+def looks_upsc_style(q: dict) -> bool:
     text = (q.get("question") or "").strip().lower()
-    starters = ("recently", "in the context", "which of the following", "consider the following statements")
+    # UPSC style often begins with these
+    starters = (
+        "consider the following statements",
+        "with reference to",
+        "which of the following",
+        "in the context of",
+        "recently",
+    )
     if not text.startswith(starters):
         return False
 
@@ -440,11 +533,13 @@ def looks_exam_style(q: dict) -> bool:
     if len(set(o.strip() for o in opts)) != 4:
         return False
 
-    if q.get("difficulty") not in ("Easy", "Moderate"):
+    exp = (q.get("explanation") or "").strip()
+    if len(exp) < 55:
         return False
 
-    exp = (q.get("explanation") or "").strip()
-    if len(exp) < 45:
+    # Avoid obvious banking terms even if slipped
+    lower_all = (q.get("question","") + " " + " ".join(opts) + " " + exp).lower()
+    if any(k in lower_all for k in ["repo", "crr", "slr", "mclr", "upi", "sebi", "irdai", "pfrda", "nbfc", "ipo"]):
         return False
 
     return True
@@ -455,6 +550,7 @@ def fix_mapping_and_keys(mcq_set: dict) -> dict:
     seen_event_keys = set()
 
     for q in mcq_set["mcqs"]:
+        # Ensure distinct options
         opts = [o.strip() for o in q["options"]]
         uniq, seen = [], set()
         for o in opts:
@@ -481,8 +577,8 @@ def fix_mapping_and_keys(mcq_set: dict) -> dict:
             q["event_key"] = ek[:60]
         seen_event_keys.add(_norm_text(q["event_key"]))
 
-        q["explanation"] = (q.get("explanation") or "")[:200]
-        q["source_hint"] = (q.get("source_hint") or "")[:120]
+        q["explanation"] = (q.get("explanation") or "")[:220]
+        q["source_hint"] = (q.get("source_hint") or "")[:80]
 
         fixed["mcqs"].append(q)
 
@@ -490,34 +586,55 @@ def fix_mapping_and_keys(mcq_set: dict) -> dict:
     return fixed
 
 
+# -------------------- GENERATE MCQS (PIPELINE) --------------------
 def generate_mcqs():
     now_ist = dt.datetime.now(IST)
     today_str = now_ist.date().isoformat()
 
     hist = load_history()
-    avoid_qs = (hist.get("questions", []) or [])[-220:]
-    avoid_event_keys = (hist.get("event_keys", []) or [])[-220:]
+    avoid_qs = (hist.get("questions", []) or [])[-250:]
+    avoid_event_keys = (hist.get("event_keys", []) or [])[-250:]
     avoid_title_norms = set(hist.get("title_norms", []) or [])
     avoid_url_hashes = set(hist.get("url_hashes", []) or [])
 
     raw = fetch_news_pool()
     fresh = filter_news_today_ist(raw, avoid_title_norms, avoid_url_hashes)
 
-    if len(fresh) < 15:
-        raise RuntimeError(f"Not enough fresh items from authentic CA sources. Found {len(fresh)}.")
+    # Exclude banking/finance, allow economy
+    fresh = [x for x in fresh if not is_banking_finance_item(x)]
+
+    # UPSC-worthiness filter (removes shallow/low-quality)
+    fresh = [x for x in fresh if is_upsc_worthy(x)]
+
+    if len(fresh) < 16:
+        raise RuntimeError(
+            f"Not enough UPSC-worthy fresh items after filters. Found {len(fresh)}. "
+            f"Try lowering MIN_TODAY_ITEMS_REQUIRED to 10."
+        )
 
     ranked = rank_news(fresh)[:RERANK_TOP_N]
     news_context = build_news_context(ranked, max_items=CONTEXT_ITEMS)
 
     best = None
-    best_good = 0
+    best_good = -1
 
+    # Try a few times to enforce UPSC quality
     for attempt in range(4):
-        mcq_set = generate_mcqs_exam_style(today_str, news_context, avoid_qs, avoid_event_keys)
+        mcq_set = generate_mcqs_upsc(today_str, news_context, avoid_qs, avoid_event_keys)
         mcq_set["date"] = today_str
         mcq_set = fix_mapping_and_keys(mcq_set)
 
-        good = [q for q in mcq_set["mcqs"] if looks_exam_style(q)]
+        # Dedupe within set by normalized question
+        deduped = []
+        seen_q = set()
+        for q in mcq_set["mcqs"]:
+            k = _norm_q(q["question"])
+            if k not in seen_q:
+                seen_q.add(k)
+                deduped.append(q)
+        mcq_set["mcqs"] = deduped[:10]
+
+        good = [q for q in mcq_set["mcqs"] if looks_upsc_style(q)]
         if len(good) >= 10:
             mcq_set["mcqs"] = good[:10]
             best = mcq_set
@@ -528,10 +645,11 @@ def generate_mcqs():
             best = mcq_set
             best_good = len(good)
 
+        # strengthen avoidance with this attempt's questions
         avoid_qs = avoid_qs + [q["question"] for q in mcq_set["mcqs"]]
 
     if best is None or len(best["mcqs"]) < 10:
-        raise RuntimeError("Could not generate exam-standard MCQs. Retry once.")
+        raise RuntimeError("Could not generate 10 UPSC-quality MCQs. Retry once.")
 
     best["mcqs"] = best["mcqs"][:10]
 
@@ -542,12 +660,18 @@ def generate_mcqs():
 
 # -------------------- QUIZ POSTING --------------------
 def shuffle_options_and_fix_answer(q: dict) -> dict:
+    """
+    Shuffles options so correct answer isn't always A.
+    Updates correct_option_id accordingly.
+    """
     options = q["options"]
     correct_text = options[q["correct_option_id"]]
+
     seed = q["question"] + correct_text
     rnd = random.Random(seed)
     shuffled = options[:]
     rnd.shuffle(shuffled)
+
     q["options"] = shuffled
     q["correct_option_id"] = shuffled.index(correct_text)
     q["correct_answer"] = correct_text
@@ -555,20 +679,37 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
 
 
 def post_competitive_closure_message():
+    # Plain text (no Markdown) to avoid parsing failures
     text = (
         "🏁 Today’s Challenge Ends Here!\n\n"
         "Comment your score below 👇\n"
         "Let’s see how many 8+ scorers we have today 🔥\n\n"
         "⏰ Back tomorrow at the same time."
     )
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True})
+    tg(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+    )
 
 
 def post_score_poll(date_str: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "question": f"📊 Vote your score ({date_str}) ✅\nHow many were correct out of 10?",
-        "options": ["10/10 🏆", "9/10 🔥", "8/10 ✅", "7/10 👍", "6/10 🙂", "5/10 📘", "4/10 🧠", "3 or less 😅"],
+        "options": [
+            "10/10 🏆",
+            "9/10 🔥",
+            "8/10 ✅",
+            "7/10 👍",
+            "6/10 🙂",
+            "5/10 📘",
+            "4/10 🧠",
+            "3 or less 😅",
+        ],
         "is_anonymous": True,
         "allows_multiple_answers": False,
     }
@@ -576,14 +717,21 @@ def post_score_poll(date_str: str):
 
 
 def post_to_channel(mcq_set: dict):
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇"})
+    tg(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": f"🧠 Daily UPSC-Style Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇",
+        },
+    )
 
     for i, q in enumerate(mcq_set["mcqs"], start=1):
         q = shuffle_options_and_fix_answer(q)
+
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
-            "options": q["options"],
+            "options": q["options"],  # Telegram expects list[str]
             "type": "quiz",
             "correct_option_id": q["correct_option_id"],
             "explanation": q["explanation"],
@@ -592,6 +740,7 @@ def post_to_channel(mcq_set: dict):
         tg("sendPoll", payload)
         time.sleep(SLEEP_BETWEEN_POLLS)
 
+    # After all 10 polls: message first, then score poll
     time.sleep(SLEEP_AFTER_QUIZ)
 
     try:
@@ -612,6 +761,7 @@ def main():
     mcq_set, used_title_norms, used_url_hashes = generate_mcqs()
     post_to_channel(mcq_set)
 
+    # Save history AFTER successful post
     hist = load_history()
     hist = update_history_with_set(
         hist,
@@ -622,7 +772,7 @@ def main():
     )
     save_history(hist)
 
-    print("✅ Posted 10 exam-style quiz polls + message + score poll successfully.")
+    print("✅ Posted 10 UPSC-style quiz polls + message + score poll successfully.")
 
 
 if __name__ == "__main__":
