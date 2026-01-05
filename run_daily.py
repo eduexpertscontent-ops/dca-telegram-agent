@@ -1,13 +1,13 @@
 import os
+import re
 import json
 import time
-import datetime as dt
-import requests
-import random
-import re
 import hashlib
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
+import random
+import datetime as dt
+from typing import List, Dict, Any, Optional, Tuple
+
+import requests
 from openai import OpenAI
 
 # -------------------- CONFIG --------------------
@@ -22,27 +22,26 @@ KEEP_LAST_DAYS = int(os.getenv("KEEP_LAST_DAYS", "15"))
 SLEEP_BETWEEN_POLLS = float(os.getenv("SLEEP_BETWEEN_POLLS", "2"))
 SLEEP_AFTER_QUIZ = float(os.getenv("SLEEP_AFTER_QUIZ", "2"))
 
-NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "25"))
-MAX_NEWS_ITEMS = int(os.getenv("MAX_NEWS_ITEMS", "260"))
-CONTEXT_ITEMS = int(os.getenv("CONTEXT_ITEMS", "80"))
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "140"))
-MIN_TODAY_ITEMS_REQUIRED = int(os.getenv("MIN_TODAY_ITEMS_REQUIRED", "18"))
+# Timezone: Asia/Kolkata (IST)
+IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 
 HISTORY_FILE = "mcq_history.json"
+HTTP_TIMEOUT = 25
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
 
 client = OpenAI()  # reads OPENAI_API_KEY from environment
-IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
 # -------------------- TELEGRAM HELPERS --------------------
 def tg(method: str, payload: dict) -> dict:
-    """
-    Telegram API wrapper with basic retry on rate limits.
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     last_err = None
 
-    for _ in range(4):  # retry up to 4 times
+    for _ in range(4):
         r = requests.post(url, json=payload, timeout=30)
         data = r.json()
 
@@ -51,21 +50,18 @@ def tg(method: str, payload: dict) -> dict:
 
         last_err = data
 
-        # Rate limit / flood control
         if data.get("error_code") == 429:
             retry_after = (data.get("parameters") or {}).get("retry_after", 5)
             print(f"⚠️ Telegram rate limit. Retrying after {retry_after}s...")
             time.sleep(int(retry_after) + 1)
             continue
 
-        # Other Telegram errors: raise
         raise RuntimeError(f"Telegram error: {data}")
 
     raise RuntimeError(f"Telegram error after retries: {last_err}")
 
 
-# -------------------- JSON SCHEMA (UPSC-level) --------------------
-# Note: Adds mcq_type, difficulty, source_hint to enforce quality; these are NOT posted to Telegram.
+# -------------------- JSON SCHEMA --------------------
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -77,10 +73,8 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
-                    "mcq_type": {"type": "string", "minLength": 3, "maxLength": 30},
-                    "difficulty": {"type": "string", "enum": ["Easy", "Moderate", "Tough"]},
-                    "question": {"type": "string", "minLength": 1, "maxLength": 300},
+                    "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
+                    "question": {"type": "string", "minLength": 1, "maxLength": 320},
                     "options": {
                         "type": "array",
                         "minItems": 4,
@@ -90,18 +84,18 @@ SCHEMA = {
                     "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
                     "correct_answer": {"type": "string", "minLength": 1, "maxLength": 120},
                     "explanation": {"type": "string", "maxLength": 220},
-                    "source_hint": {"type": "string", "maxLength": 80},
+                    "source_url": {"type": "string", "minLength": 5, "maxLength": 400},
+                    "source_title": {"type": "string", "minLength": 3, "maxLength": 200},
                 },
                 "required": [
                     "event_key",
-                    "mcq_type",
-                    "difficulty",
                     "question",
                     "options",
                     "correct_option_id",
                     "correct_answer",
                     "explanation",
-                    "source_hint",
+                    "source_url",
+                    "source_title",
                 ],
                 "additionalProperties": False,
             },
@@ -117,27 +111,29 @@ def load_history() -> dict:
     """
     {
       "dates": {
-        "YYYY-MM-DD": {"questions":[...], "event_keys":[...], "title_norms":[...], "url_hashes":[...]}
+        "YYYY-MM-DD": {
+          "event_keys":[...],
+          "question_norms":[...],
+          "url_hashes":[...]
+        }
       },
-      "questions":[...],
       "event_keys":[...],
-      "title_norms":[...],
+      "question_norms":[...],
       "url_hashes":[...]
     }
     """
     if not os.path.exists(HISTORY_FILE):
-        return {"dates": {}, "questions": [], "event_keys": [], "title_norms": [], "url_hashes": []}
+        return {"dates": {}, "event_keys": [], "question_norms": [], "url_hashes": []}
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             hist = json.load(f)
         hist.setdefault("dates", {})
-        hist.setdefault("questions", [])
         hist.setdefault("event_keys", [])
-        hist.setdefault("title_norms", [])
+        hist.setdefault("question_norms", [])
         hist.setdefault("url_hashes", [])
         return hist
     except Exception:
-        return {"dates": {}, "questions": [], "event_keys": [], "title_norms": [], "url_hashes": []}
+        return {"dates": {}, "event_keys": [], "question_norms": [], "url_hashes": []}
 
 
 def save_history(hist: dict) -> None:
@@ -145,14 +141,29 @@ def save_history(hist: dict) -> None:
         json.dump(hist, f, ensure_ascii=False, indent=2)
 
 
-def update_history_with_set(hist: dict, mcq_set: dict, keep_last_days: int, used_title_norms, used_url_hashes) -> dict:
+def _norm_text(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^a-z0-9 ]+", "", s)
+    return s.strip()
+
+
+def _url_hash(url: str) -> str:
+    return hashlib.sha256((url or "").strip().encode("utf-8")).hexdigest()[:24]
+
+
+def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
     today = mcq_set["date"]
     hist.setdefault("dates", {})
+
+    day_event_keys = [q["event_key"] for q in mcq_set["mcqs"]]
+    day_qnorms = [_norm_text(q["question"]) for q in mcq_set["mcqs"]]
+    day_uhashes = [_url_hash(q["source_url"]) for q in mcq_set["mcqs"]]
+
     hist["dates"][today] = {
-        "questions": [q["question"] for q in mcq_set["mcqs"]],
-        "event_keys": [q["event_key"] for q in mcq_set["mcqs"]],
-        "title_norms": list(used_title_norms),
-        "url_hashes": list(used_url_hashes),
+        "event_keys": day_event_keys,
+        "question_norms": day_qnorms,
+        "url_hashes": day_uhashes,
     }
 
     # prune old dates
@@ -162,508 +173,491 @@ def update_history_with_set(hist: dict, mcq_set: dict, keep_last_days: int, used
             hist["dates"].pop(d, None)
 
     # rebuild flattened lists (bounded)
-    qs, eks, tns, uhs = [], [], [], []
+    eks, qns, uhs = [], [], []
     for d in sorted(hist["dates"].keys()):
-        qs.extend(hist["dates"][d].get("questions", []))
         eks.extend(hist["dates"][d].get("event_keys", []))
-        tns.extend(hist["dates"][d].get("title_norms", []))
+        qns.extend(hist["dates"][d].get("question_norms", []))
         uhs.extend(hist["dates"][d].get("url_hashes", []))
 
-    hist["questions"] = qs[-700:]
-    hist["event_keys"] = eks[-700:]
-    hist["title_norms"] = tns[-1200:]
-    hist["url_hashes"] = uhs[-1200:]
+    hist["event_keys"] = eks[-400:]
+    hist["question_norms"] = qns[-400:]
+    hist["url_hashes"] = uhs[-600:]
     return hist
 
 
-# -------------------- NORMALIZATION / DEDUPE --------------------
-def _norm_text(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^a-z0-9\s]", "", s)
-    return s.strip()
-
-
-def _hash_url(url: str) -> str:
-    return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
-
-
-def _dedupe_keep_order_by_key(items, key_fn):
-    seen = set()
-    out = []
-    for it in items:
-        k = key_fn(it)
-        if k not in seen:
-            seen.add(k)
-            out.append(it)
-    return out
-
-
-def _norm_q(s: str) -> str:
-    return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
-
-
-# -------------------- RSS FETCH --------------------
-def _get(url: str) -> str:
-    r = requests.get(url, timeout=NEWS_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+# -------------------- LIGHT HTML PARSING (NO RSS) --------------------
+def http_get(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.text
 
 
-def _safe_parse_date(pub: str):
-    if not pub:
-        return None
-    try:
-        d = parsedate_to_datetime(pub)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        return d.astimezone(IST)
-    except Exception:
-        return None
+def strip_html(html: str) -> str:
+    # very basic (works without bs4)
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<.*?>", " ", text)
+    text = re.sub(r"&nbsp;|&#160;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&quot;", '"', text)
+    text = re.sub(r"&#39;|&apos;", "'", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def _parse_rss_items(xml_text: str):
-    root = ET.fromstring(xml_text)
-    channel = root.find("channel")
-    if channel is None:
-        return []
+def extract_meta_date(html: str) -> Optional[str]:
+    """
+    Tries to extract ISO-like date from meta tags or common patterns.
+    Returns YYYY-MM-DD if found.
+    """
+    # common meta tags
+    candidates = []
+
+    # meta property="article:published_time"
+    m = re.search(r'property=["\']article:published_time["\']\s+content=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        candidates.append(m.group(1))
+
+    # meta name="publish-date" / "date" / "parsely-pub-date"
+    for name in ["publish-date", "date", "parsely-pub-date", "pubdate", "DC.date.issued"]:
+        m = re.search(rf'name=["\']{re.escape(name)}["\']\s+content=["\']([^"\']+)["\']', html, re.I)
+        if m:
+            candidates.append(m.group(1))
+
+    # time datetime="..."
+    m = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        candidates.append(m.group(1))
+
+    for c in candidates:
+        iso = normalize_date_to_yyyy_mm_dd(c)
+        if iso:
+            return iso
+
+    # fallback: try "January 5, 2026" pattern
+    m = re.search(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})",
+        html,
+        re.I,
+    )
+    if m:
+        month = m.group(1).lower()
+        day = int(m.group(2))
+        year = int(m.group(3))
+        month_num = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+        }[month]
+        return f"{year:04d}-{month_num:02d}-{day:02d}"
+
+    return None
+
+
+def normalize_date_to_yyyy_mm_dd(raw: str) -> Optional[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    # ISO with time
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # 05-01-2026 or 05/01/2026 (assume D-M-Y)
+    m = re.match(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", raw)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+
+    return None
+
+
+def now_ist_date() -> dt.date:
+    return (dt.datetime.utcnow() + IST_OFFSET).date()
+
+
+def ist_today_str() -> str:
+    return now_ist_date().isoformat()
+
+
+def ist_yesterday_str() -> str:
+    return (now_ist_date() - dt.timedelta(days=1)).isoformat()
+
+
+# -------------------- SOURCES (AUTHENTIC CA SITES) --------------------
+def collect_affairscloud(today_iso: str) -> List[Dict[str, str]]:
+    """
+    AffairsCloud has date-wise pages. We scrape the 'Current Affairs Today' listing
+    and pick pages whose title/url contains today's date components.
+    """
+    base = "https://affairscloud.com/current-affairs-ca/current-affairs-today/"
+    html = http_get(base)
+
+    # Find article links (date-wise posts)
+    links = re.findall(r'href=["\'](https://affairscloud\.com/current-affairs-[^"\']+)["\']', html, re.I)
+    links = list(dict.fromkeys(links))[:40]
 
     items = []
-    for item in channel.findall("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = (item.findtext("pubDate") or "").strip()
-        desc = (item.findtext("description") or "").strip()
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page) or "AffairsCloud Current Affairs"
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            items.append({"source": "AffairsCloud", "url": url, "title": title, "date": pub})
+        except Exception:
+            continue
 
-        pub_dt = _safe_parse_date(pub)
+    # Keep only today
+    return [it for it in items if it.get("date") == today_iso]
 
-        items.append(
-            {
-                "title": title,
-                "link": link,
-                "published_ist": pub_dt,
-                "description": re.sub(r"<.*?>", "", desc)[:280],
-            }
-        )
+
+def collect_gktoday(today_iso: str) -> List[Dict[str, str]]:
+    base = "https://www.gktoday.in/current-affairs/"
+    html = http_get(base)
+
+    links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
+    # reduce junk
+    links = [u for u in links if "/current-affairs/" not in u and "wp-" not in u]
+    links = list(dict.fromkeys(links))[:60]
+
+    items = []
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            # GKToday home sometimes shows older; we enforce exact today only
+            if pub == today_iso:
+                items.append({"source": "GKToday", "url": url, "title": title, "date": pub})
+        except Exception:
+            continue
     return items
 
 
-# -------------------- SOURCES (UPSC + GOVT EXAM PREP) --------------------
-def fetch_news_pool():
-    """
-    Mix of Tier-1 UPSC-friendly + govt-exam-prep CA sites (as requested).
-    """
-    feeds = [
-        # Tier-1 (UPSC-friendly)
-        ("PIB", "https://pib.gov.in/RssMain.aspx?mod=0&ln=1"),
-        ("PRS", "https://prsindia.org/rss.xml"),
-        ("IndianExpress-Explained", "https://indianexpress.com/section/explained/feed/"),
-        ("DownToEarth", "https://www.downtoearth.org.in/rss"),
+def collect_adda247(today_iso: str) -> List[Dict[str, str]]:
+    base = "https://currentaffairs.adda247.com/"
+    html = http_get(base)
 
-        # Govt-exam-prep CA (your allowed list)
-        ("AffairsCloud", "https://affairscloud.com/feed/"),
-        ("GKToday", "https://www.gktoday.in/feed/"),
-        ("JagranJosh-CA", "https://www.jagranjosh.com/rss/current-affairs.xml"),
-        ("Adda247-CA", "https://www.adda247.com/jobs/feed/"),
-    ]
+    # Posts are under currentaffairs.adda247.com/<slug>/
+    links = re.findall(r'href=["\'](https://currentaffairs\.adda247\.com/[^"\']+/)["\']', html, re.I)
+    links = [u for u in links if "category" not in u and "tag" not in u and "page" not in u]
+    links = list(dict.fromkeys(links))[:80]
 
-    all_items = []
-    for source, url in feeds:
+    items = []
+    for url in links:
         try:
-            xml_text = _get(url)
-            items = _parse_rss_items(xml_text)
-            for it in items:
-                it["source"] = source
-            all_items.extend(items)
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            if pub == today_iso:
+                items.append({"source": "Adda247", "url": url, "title": title, "date": pub})
+        except Exception:
+            continue
+    return items
+
+
+def collect_jagranjosh(today_iso: str) -> List[Dict[str, str]]:
+    base = "https://www.jagranjosh.com/current-affairs"
+    html = http_get(base)
+
+    # Jagran links look like https://www.jagranjosh.com/general-knowledge/<slug>-<digits>
+    links = re.findall(r'href=["\'](https://www\.jagranjosh\.com/[^"\']+)["\']', html, re.I)
+    links = [u for u in links if "/general-knowledge/" in u or "/current-affairs/" in u]
+    links = list(dict.fromkeys(links))[:80]
+
+    items = []
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            if pub == today_iso:
+                items.append({"source": "JagranJosh", "url": url, "title": title, "date": pub})
+        except Exception:
+            continue
+    return items
+
+
+def extract_title(html: str) -> Optional[str]:
+    m = re.search(r"(?is)<title>\s*(.*?)\s*</title>", html)
+    if not m:
+        return None
+    t = strip_html(m.group(1))
+    # clean common suffixes
+    t = re.sub(r"\s*\|\s*.*$", "", t).strip()
+    return t[:180] if t else None
+
+
+def guess_date_from_url(url: str) -> Optional[str]:
+    """
+    If URL contains /5-january-2026/ or /2026/01/05/ etc.
+    """
+    u = url.lower()
+
+    # /2026/01/05/
+    m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", u)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # /5-january-2026/
+    m = re.search(
+        r"/(\d{1,2})-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{4})/?",
+        u,
+    )
+    if m:
+        day = int(m.group(1))
+        mon = m.group(2)
+        year = int(m.group(3))
+        mon_num = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+        }[mon]
+        return f"{year:04d}-{mon_num:02d}-{day:02d}"
+
+    return None
+
+
+def fetch_article_snippet(url: str, max_chars: int = 900) -> str:
+    html = http_get(url)
+    text = strip_html(html)
+    # keep it short for token control
+    return text[:max_chars]
+
+
+def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Collects same-day items from all sources.
+    If not enough, allows yesterday as fallback (still recent).
+    """
+    today = ist_today_str()
+    yesterday = ist_yesterday_str()
+
+    sources = [collect_affairscloud, collect_gktoday, collect_adda247, collect_jagranjosh]
+
+    all_today = []
+    for fn in sources:
+        try:
+            got = fn(today)
+            print(f"✅ {fn.__name__}: {len(got)} items for {today}")
+            all_today.extend(got)
         except Exception as e:
-            print(f"⚠️ Failed to fetch {source}: {e}")
+            print(f"⚠️ {fn.__name__} failed: {e}")
 
-    all_items = [x for x in all_items if x.get("title") and x.get("link")]
-    all_items = all_items[:MAX_NEWS_ITEMS]
-    all_items = _dedupe_keep_order_by_key(all_items, lambda x: (_norm_text(x["title"]), _hash_url(x["link"])))
-    return all_items
+    # Deduplicate by URL
+    seen = set()
+    dedup_today = []
+    for it in all_today:
+        h = _url_hash(it["url"])
+        if h not in seen:
+            seen.add(h)
+            dedup_today.append(it)
 
+    if len(dedup_today) >= 14:
+        return today, dedup_today
 
-# -------------------- FRESHNESS FILTER (IST, SAME DAY) --------------------
-def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
-    now_ist = dt.datetime.now(IST)
-    today = now_ist.date()
-
-    def is_today(it):
-        return it.get("published_ist") and it["published_ist"].date() == today
-
-    today_items = [it for it in items if is_today(it)]
-
-    # If too few today items, allow last 24h
-    if len(today_items) < MIN_TODAY_ITEMS_REQUIRED:
-        cutoff = now_ist - dt.timedelta(hours=24)
-        pool = [it for it in items if it.get("published_ist") and it["published_ist"] >= cutoff]
-    else:
-        pool = today_items
-
-    out = []
-    for it in pool:
-        tn = _norm_text(it["title"])
-        uh = _hash_url(it["link"])
-        if tn in avoid_title_norms:
+    # fallback: add yesterday items (still not "old 2025 stuff")
+    all_yday = []
+    for fn in sources:
+        try:
+            got = fn(yesterday)
+            all_yday.extend(got)
+        except Exception:
             continue
-        if uh in avoid_url_hashes:
-            continue
-        out.append(it)
 
-    out = _dedupe_keep_order_by_key(out, lambda x: _norm_text(x["title"]))
-    return out
+    for it in all_yday:
+        h = _url_hash(it["url"])
+        if h not in seen:
+            seen.add(h)
+            it = dict(it)
+            it["date"] = yesterday
+            dedup_today.append(it)
 
-
-# -------------------- EXCLUDE BANKING/FINANCE (ALLOW ECONOMY) --------------------
-BANK_FIN_EXCLUDE = [
-    "rbi", "repo", "reverse repo", "crr", "slr", "mclr", "mpc",
-    "nbfc", "banking", "bank ", "banks", "loan", "credit", "debit",
-    "sebi", "irdai", "pfrda", "mutual fund", "ipo", "share market",
-    "bond", "g-sec", "treasury bill", "forex", "rupee hits", "stocks",
-    "upi", "payments", "digital payment", "fintech",
-]
-
-ECON_ALLOWED = [
-    "gdp", "inflation", "cpi", "wpi", "fiscal", "budget", "tax",
-    "gst", "subsidy", "poverty", "employment", "unemployment",
-    "agriculture", "msp", "food security", "trade", "export", "import",
-    "current account", "cad", "imf", "world bank", "economic survey",
-]
-
-def is_banking_finance_item(item: dict) -> bool:
-    txt = (item.get("title","") + " " + item.get("description","")).lower()
-    bank_hit = any(k in txt for k in BANK_FIN_EXCLUDE)
-    econ_hit = any(k in txt for k in ECON_ALLOWED)
-    return bank_hit and not econ_hit
+    # date label still "today" for posting; but content may include yesterday if needed
+    return today, dedup_today
 
 
-# -------------------- UPSC-WORTHINESS FILTER --------------------
-UPSC_CORE_KEYWORDS = [
-    # Polity/Governance/Law
-    "bill", "act", "amendment", "ordinance", "parliament", "supreme court", "high court",
-    "committee", "commission", "tribunal", "authority", "constitution",
-    # Governance/programmes
-    "scheme", "yojana", "mission", "policy", "guidelines", "framework",
-    # Environment/Geo
-    "biodiversity", "wildlife", "tiger reserve", "national park", "wetland", "climate", "pollution",
-    "glacier", "river", "basin", "earthquake", "cyclone",
-    # IR/Summits
-    "g20", "brics", "sco", "cop", "asean", "quad", "un ", "who", "wto",
-    # Economy (non-banking)
-    "gdp", "inflation", "cpi", "fiscal", "budget", "gst", "subsidy", "trade",
-    # Science/Tech (UPSC)
-    "isro", "satellite", "space", "semiconductor", "quantum", "biotech", "genome",
-]
-
-SHALLOW_PATTERNS = [
-    "brand ambassador", "celebrated", "anniversary", "wins", "won the match",
-    "trailer", "box office", "viral", "launched a new app", "opened a new outlet",
-]
-
-def is_upsc_worthy(item: dict) -> bool:
-    txt = (item.get("title","") + " " + item.get("description","")).lower()
-    if any(p in txt for p in SHALLOW_PATTERNS):
-        return False
-    return any(k in txt for k in UPSC_CORE_KEYWORDS)
+# -------------------- MCQ GENERATION --------------------
+def _schema_for_n(n: int) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string"},
+            "mcqs": {
+                "type": "array",
+                "minItems": n,
+                "maxItems": n,
+                "items": SCHEMA["properties"]["mcqs"]["items"],
+            },
+        },
+        "required": ["date", "mcqs"],
+        "additionalProperties": False,
+    }
 
 
-# -------------------- EXAM RELEVANCY SCORING (POSITIVE ONLY) --------------------
-POSITIVE_KEYWORDS = [
-    "parliament", "bill", "act", "amendment", "committee", "commission", "tribunal",
-    "scheme", "mission", "policy", "guidelines", "framework",
-    "biodiversity", "wildlife", "wetland", "climate", "pollution",
-    "isro", "satellite", "space", "quantum", "semiconductor", "biotech",
-    "g20", "brics", "sco", "cop", "un", "who", "wto",
-    "gdp", "inflation", "cpi", "fiscal", "budget", "gst", "trade",
-]
-
-def exam_relevancy_score(item: dict) -> int:
-    title = _norm_text(item.get("title", ""))
-    desc = _norm_text(item.get("description", ""))
-    text = f"{title} {desc}"
-
-    score = 0
-
-    src = (item.get("source") or "").lower()
-    if "pib" in src:
-        score += 12
-    elif "prs" in src:
-        score += 12
-    elif "indianexpress-explained" in src:
-        score += 10
-    elif "downtoearth" in src:
-        score += 10
-    elif "affairscloud" in src:
-        score += 5
-    elif "gktoday" in src:
-        score += 5
-    elif "jagranjosh" in src:
-        score += 3
-    elif "adda247" in src:
-        score += 3
-
-    for kw in POSITIVE_KEYWORDS:
-        if kw in text:
-            score += 2
-
-    if "india" in text or "indian" in text:
-        score += 1
-
-    if len(title) < 25:
-        score -= 1
-
-    return score
-
-
-def rank_news(items):
-    scored = []
-    for it in items:
-        it = dict(it)
-        it["exam_score"] = exam_relevancy_score(it)
-        scored.append(it)
-
-    scored.sort(
-        key=lambda x: (x.get("exam_score", 0), x.get("published_ist") or dt.datetime.min.replace(tzinfo=IST)),
-        reverse=True,
-    )
-    return scored
-
-
-def build_news_context(items, max_items: int):
-    picked = items[:max_items]
-    lines = []
-    for i, it in enumerate(picked, start=1):
-        pub = it.get("published_ist")
-        pub_s = pub.strftime("%Y-%m-%d %H:%M IST") if pub else "unknown time"
-        lines.append(
-            f"{i}. [score={it.get('exam_score',0)}] [{it['source']}] {pub_s} | {it['title']} | {it['link']} | {it.get('description','')}"
+def generate_mcqs() -> dict:
+    """
+    1) Collect fresh items from authentic CA sites (same-day; yday fallback only if needed).
+    2) Remove anything repeated via history (URL hash + title norms).
+    3) Ask model to select most exam-relevant 10 and write UPSC-level MCQs.
+    """
+    today_label, fresh_items = collect_fresh_items()
+    if len(fresh_items) < 10:
+        raise RuntimeError(
+            f"Not enough fresh items from authentic CA sources for today. Found {len(fresh_items)}."
         )
-    return "\n".join(lines)
 
+    hist = load_history()
+    used_url_hashes = set(hist.get("url_hashes", [])[-600:])
+    used_event_keys = set(_norm_text(x) for x in (hist.get("event_keys", [])[-400:]))
+    used_qnorms = set(hist.get("question_norms", [])[-400:])
 
-# -------------------- OPENAI: UPSC PRELIMS STYLE (NO BANKING/FINANCE) --------------------
-UPSC_STYLE_RULES = """
-You are a UPSC CSE Prelims (GS Paper 1) question setter.
+    # Filter out previously used URLs and very similar titles
+    filtered = []
+    seen_title = set()
+    for it in fresh_items:
+        uh = _url_hash(it["url"])
+        if uh in used_url_hashes:
+            continue
+        tn = _norm_text(it["title"])
+        if tn in seen_title:
+            continue
+        seen_title.add(tn)
+        filtered.append(it)
 
-Core philosophy:
-- Test conceptual understanding linked with current affairs.
-- Avoid one-line trivia.
-- Prefer statement-based MCQs.
+    if len(filtered) < 12:
+        # If history is too strict, relax URL only (still prevents repeats strongly)
+        filtered = [it for it in fresh_items if _url_hash(it["url"]) not in used_url_hashes]
 
-Mandatory distribution:
-- At least 7 out of 10 questions MUST be statement-based (2 or 3 statements).
-- Remaining can be: correctly matched pairs, institutions & functions, environment & geography, reports/indices (concept + purpose).
+    # Build an evidence pack for the model (title+url+short snippet)
+    # Keep to a manageable size (top 22 items)
+    pack = []
+    for it in filtered[:22]:
+        try:
+            snippet = fetch_article_snippet(it["url"], max_chars=800)
+        except Exception:
+            snippet = ""
+        pack.append(
+            {
+                "source": it["source"],
+                "date": it["date"],
+                "title": it["title"],
+                "url": it["url"],
+                "snippet": snippet,
+            }
+        )
 
-Hard exclusions:
-- NO banking/finance MCQs: RBI/SEBI/IRDAI/PFRDA, repo/CRR/SLR, UPI/payments, banks/NBFCs, stock/IPO/mutual funds.
-- NO sports/entertainment/trivial awards.
-- NO trivial appointments (unless constitutional/major international office).
-
-Statement option format (use exactly this when using 2 statements):
-(a) 1 only
-(b) 2 only
-(c) Both 1 and 2
-(d) Neither 1 nor 2
-
-Other hard rules:
-1) Use ONLY the provided news items. Do not invent facts.
-2) Every MCQ must be based on a DIFFERENT news story.
-3) Make options close/plausible (UPSC-like distractors).
-4) Keep explanation <= 220 chars and include:
-   - Current fact (what happened)
-   - Static concept link (what is it/role/definition)
-5) Use formal UPSC tone (no quiz language).
-"""
-
-def generate_mcqs_upsc(today_str: str, news_context: str, avoid_questions: list, avoid_event_keys: list):
     system = (
-        "You write UPSC Prelims-quality MCQs in ENGLISH.\n"
-        "Use ONLY the provided news list.\n"
-        + UPSC_STYLE_RULES +
-        "\nReturn STRICT JSON as per schema."
+        "You are an expert UPSC/State PCS question setter.\n"
+        "You MUST create EXACTLY 10 UPSC-level current affairs MCQs.\n"
+        "Use ONLY the provided evidence pack (title/url/snippet). Do NOT introduce outside facts.\n"
+        "TARGET EXAMS: UPSC, State PCS, SSC (CGL), Railways, and general govt exams.\n\n"
+        "STRICT CONSTRAINTS:\n"
+        "- SAME-DAY FOCUS: Prefer items dated today; if pack includes yesterday, use it only if needed.\n"
+        "- NO BANKING/FINANCE QUESTIONS: Avoid RBI circular trivia, bank appointments, IBPS-type banking CA.\n"
+        "  (Economy is allowed: GDP, inflation, fiscal policy, govt schemes, indices, major reforms, trade, etc.)\n"
+        "- Framing must look like real exam MCQs: 'With reference to...', 'Consider the following statements...',\n"
+        "  'Which of the following is/are correct?', 'Match the following', etc.\n"
+        "- Each MCQ must be from a DIFFERENT event/topic (no duplicates).\n"
+        "- event_key must be unique (3–10 words), should identify the event.\n"
+        "- correct_answer must EXACTLY match one option.\n"
+        "- correct_option_id must match correct_answer index.\n"
+        "- Options must be plausible and distinct.\n"
+        "- Explanation <= 220 characters and should justify WHY the correct option is correct.\n"
+        "- Include source_url and source_title from the evidence pack for each MCQ.\n"
     )
 
-    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:200]])
-    avoid_keys_block = "\n".join([f"- {a}" for a in (avoid_event_keys or [])[:200]])
+    avoid_block = {
+        "used_event_keys": sorted(list(used_event_keys))[:120],
+        "used_question_norms": sorted(list(used_qnorms))[:120],
+    }
 
-    user = (
-        f"DATE (IST): {today_str}\n\n"
-        "NEWS ITEMS (use ONLY these):\n"
-        f"{news_context}\n\n"
-        "Create EXACTLY 10 UPSC Prelims-quality MCQs.\n"
-        "- Pick the MOST UPSC-relevant items.\n"
-        "- No fixed quotas by topic.\n"
-        "- Ensure India coverage is present naturally if today's items support it.\n\n"
-        "AVOID repeating ANY of these prior questions/topics:\n"
-        f"{avoid_block}\n\n"
-        "AVOID these prior event_keys/topics:\n"
-        f"{avoid_keys_block}\n\n"
-        "For each MCQ also include:\n"
-        "- mcq_type (e.g., Statement-based / Correct match / Institution / Environment / Report)\n"
-        "- difficulty (Easy/Moderate/Tough)\n"
-        "- source_hint (just source label like PIB/PRS/GKToday etc.)\n"
-    )
+    user = {
+        "posting_date_label": today_label,
+        "evidence_pack": pack,
+        "avoid": avoid_block,
+        "output_rules": "Return JSON strictly as per schema.",
+    }
+
+    schema = _schema_for_n(10)
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
-        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        text={"format": {"type": "json_schema", "name": "daily_upsc_mcqs", "strict": True, "schema": SCHEMA}},
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "daily_upsc_level_ca_mcqs",
+                "strict": True,
+                "schema": schema,
+            }
+        },
     )
-    return json.loads(resp.output_text)
+
+    mcq_set = json.loads(resp.output_text)
+    mcq_set["date"] = today_label  # ensure label is today for your channel
+    return mcq_set
 
 
-# -------------------- QUALITY CHECKS --------------------
-def looks_upsc_style(q: dict) -> bool:
-    text = (q.get("question") or "").strip().lower()
-    # UPSC style often begins with these
-    starters = (
-        "consider the following statements",
-        "with reference to",
-        "which of the following",
-        "in the context of",
-        "recently",
-    )
-    if not text.startswith(starters):
-        return False
-
-    opts = q.get("options") or []
-    if len(opts) != 4:
-        return False
-    if len(set(o.strip() for o in opts)) != 4:
-        return False
-
-    exp = (q.get("explanation") or "").strip()
-    if len(exp) < 55:
-        return False
-
-    # Avoid obvious banking terms even if slipped
-    lower_all = (q.get("question","") + " " + " ".join(opts) + " " + exp).lower()
-    if any(k in lower_all for k in ["repo", "crr", "slr", "mclr", "upi", "sebi", "irdai", "pfrda", "nbfc", "ipo"]):
-        return False
-
-    return True
+# -------------------- QUALITY GUARDS --------------------
+def enforce_no_bank_terms(q: Dict[str, Any]) -> bool:
+    """
+    Hard guard to reduce accidental banking CA.
+    """
+    bad = [
+        "bank", "ibps", "sbi", "rrb", "nbfc", "repo rate", "mclr",
+        "basel", "npa", "crr", "slr", "rtgs", "neft", "upi limits",
+        "scheduled commercial bank",
+    ]
+    text = (q.get("question", "") + " " + " ".join(q.get("options", []))).lower()
+    return not any(b in text for b in bad)
 
 
-def fix_mapping_and_keys(mcq_set: dict) -> dict:
-    fixed = {"date": mcq_set["date"], "mcqs": []}
-    seen_event_keys = set()
-
+def normalize_and_dedupe_mcqs(mcq_set: dict) -> dict:
+    seen_q = set()
+    seen_ek = set()
+    out = []
     for q in mcq_set["mcqs"]:
-        # Ensure distinct options
-        opts = [o.strip() for o in q["options"]]
-        uniq, seen = [], set()
-        for o in opts:
-            oo = o if o else "—"
-            if oo in seen:
-                oo = oo + " "
-            seen.add(oo)
-            uniq.append(oo)
-        q["options"] = uniq[:4]
+        qn = _norm_text(q["question"])
+        ek = _norm_text(q["event_key"])
+        if qn in seen_q or ek in seen_ek:
+            continue
+        if not enforce_no_bank_terms(q):
+            continue
+        # ensure answer mapping is correct
+        if q["correct_answer"] not in q["options"]:
+            continue
+        if q["options"].index(q["correct_answer"]) != q["correct_option_id"]:
+            q["correct_option_id"] = q["options"].index(q["correct_answer"])
 
-        ca = (q.get("correct_answer") or "").strip()
-        if ca in q["options"]:
-            q["correct_option_id"] = q["options"].index(ca)
-        else:
-            idx = q.get("correct_option_id", 0)
-            idx = idx if isinstance(idx, int) and 0 <= idx <= 3 else 0
-            q["correct_answer"] = q["options"][idx]
-            q["correct_option_id"] = idx
+        # unique options
+        if len(set(_norm_text(x) for x in q["options"])) != 4:
+            continue
 
-        ek = (q.get("event_key") or "").strip()
-        ek_n = _norm_text(ek)
-        if not ek_n or ek_n in seen_event_keys:
-            ek = (ek[:45] + " " + str(len(seen_event_keys) + 1)).strip()
-            q["event_key"] = ek[:60]
-        seen_event_keys.add(_norm_text(q["event_key"]))
+        seen_q.add(qn)
+        seen_ek.add(ek)
+        out.append(q)
 
-        q["explanation"] = (q.get("explanation") or "")[:220]
-        q["source_hint"] = (q.get("source_hint") or "")[:80]
+    # If less than 10 after guards, keep best effort (but try one regeneration)
+    if len(out) < 10:
+        mcq_set["mcqs"] = out
+        return mcq_set
 
-        fixed["mcqs"].append(q)
-
-    fixed["mcqs"] = fixed["mcqs"][:10]
-    return fixed
-
-
-# -------------------- GENERATE MCQS (PIPELINE) --------------------
-def generate_mcqs():
-    now_ist = dt.datetime.now(IST)
-    today_str = now_ist.date().isoformat()
-
-    hist = load_history()
-    avoid_qs = (hist.get("questions", []) or [])[-250:]
-    avoid_event_keys = (hist.get("event_keys", []) or [])[-250:]
-    avoid_title_norms = set(hist.get("title_norms", []) or [])
-    avoid_url_hashes = set(hist.get("url_hashes", []) or [])
-
-    raw = fetch_news_pool()
-    fresh = filter_news_today_ist(raw, avoid_title_norms, avoid_url_hashes)
-
-    # Exclude banking/finance, allow economy
-    fresh = [x for x in fresh if not is_banking_finance_item(x)]
-
-    # UPSC-worthiness filter (removes shallow/low-quality)
-    fresh = [x for x in fresh if is_upsc_worthy(x)]
-
-    if len(fresh) < 16:
-        raise RuntimeError(
-            f"Not enough UPSC-worthy fresh items after filters. Found {len(fresh)}. "
-            f"Try lowering MIN_TODAY_ITEMS_REQUIRED to 10."
-        )
-
-    ranked = rank_news(fresh)[:RERANK_TOP_N]
-    news_context = build_news_context(ranked, max_items=CONTEXT_ITEMS)
-
-    best = None
-    best_good = -1
-
-    # Try a few times to enforce UPSC quality
-    for attempt in range(4):
-        mcq_set = generate_mcqs_upsc(today_str, news_context, avoid_qs, avoid_event_keys)
-        mcq_set["date"] = today_str
-        mcq_set = fix_mapping_and_keys(mcq_set)
-
-        # Dedupe within set by normalized question
-        deduped = []
-        seen_q = set()
-        for q in mcq_set["mcqs"]:
-            k = _norm_q(q["question"])
-            if k not in seen_q:
-                seen_q.add(k)
-                deduped.append(q)
-        mcq_set["mcqs"] = deduped[:10]
-
-        good = [q for q in mcq_set["mcqs"] if looks_upsc_style(q)]
-        if len(good) >= 10:
-            mcq_set["mcqs"] = good[:10]
-            best = mcq_set
-            best_good = 10
-            break
-
-        if len(good) > best_good:
-            best = mcq_set
-            best_good = len(good)
-
-        # strengthen avoidance with this attempt's questions
-        avoid_qs = avoid_qs + [q["question"] for q in mcq_set["mcqs"]]
-
-    if best is None or len(best["mcqs"]) < 10:
-        raise RuntimeError("Could not generate 10 UPSC-quality MCQs. Retry once.")
-
-    best["mcqs"] = best["mcqs"][:10]
-
-    used_title_norms = {_norm_text(it["title"]) for it in ranked[:CONTEXT_ITEMS]}
-    used_url_hashes = {_hash_url(it["link"]) for it in ranked[:CONTEXT_ITEMS]}
-    return best, used_title_norms, used_url_hashes
+    mcq_set["mcqs"] = out[:10]
+    return mcq_set
 
 
 # -------------------- QUIZ POSTING --------------------
 def shuffle_options_and_fix_answer(q: dict) -> dict:
-    """
-    Shuffles options so correct answer isn't always A.
-    Updates correct_option_id accordingly.
-    """
     options = q["options"]
     correct_text = options[q["correct_option_id"]]
 
@@ -679,7 +673,6 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
 
 
 def post_competitive_closure_message():
-    # Plain text (no Markdown) to avoid parsing failures
     text = (
         "🏁 Today’s Challenge Ends Here!\n\n"
         "Comment your score below 👇\n"
@@ -721,7 +714,7 @@ def post_to_channel(mcq_set: dict):
         "sendMessage",
         {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": f"🧠 Daily UPSC-Style Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇",
+            "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 UPSC-level MCQ polls below 👇",
         },
     )
 
@@ -731,7 +724,7 @@ def post_to_channel(mcq_set: dict):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
-            "options": q["options"],  # Telegram expects list[str]
+            "options": q["options"],
             "type": "quiz",
             "correct_option_id": q["correct_option_id"],
             "explanation": q["explanation"],
@@ -740,7 +733,6 @@ def post_to_channel(mcq_set: dict):
         tg("sendPoll", payload)
         time.sleep(SLEEP_BETWEEN_POLLS)
 
-    # After all 10 polls: message first, then score poll
     time.sleep(SLEEP_AFTER_QUIZ)
 
     try:
@@ -758,21 +750,31 @@ def post_to_channel(mcq_set: dict):
 
 # -------------------- MAIN --------------------
 def main():
-    mcq_set, used_title_norms, used_url_hashes = generate_mcqs()
+    mcq_set = generate_mcqs()
+    mcq_set = normalize_and_dedupe_mcqs(mcq_set)
+
+    # If guards reduced count, try one more regeneration to fill
+    if len(mcq_set["mcqs"]) < 10:
+        print(f"⚠️ After quality guards only {len(mcq_set['mcqs'])} MCQs. Regenerating once...")
+        mcq_set2 = generate_mcqs()
+        mcq_set2 = normalize_and_dedupe_mcqs(mcq_set2)
+        merged = (mcq_set["mcqs"] + mcq_set2["mcqs"])
+        # final unique merge
+        temp = {"date": mcq_set["date"], "mcqs": merged}
+        temp = normalize_and_dedupe_mcqs(temp)
+        mcq_set["mcqs"] = temp["mcqs"][:10]
+
+    if len(mcq_set["mcqs"]) < 10:
+        raise RuntimeError(f"Could not reach 10 high-quality UPSC-level MCQs. Got {len(mcq_set['mcqs'])}.")
+
     post_to_channel(mcq_set)
 
-    # Save history AFTER successful post
+    # Save history AFTER success
     hist = load_history()
-    hist = update_history_with_set(
-        hist,
-        mcq_set,
-        keep_last_days=KEEP_LAST_DAYS,
-        used_title_norms=used_title_norms,
-        used_url_hashes=used_url_hashes,
-    )
+    hist = update_history(hist, mcq_set, keep_last_days=KEEP_LAST_DAYS)
     save_history(hist)
 
-    print("✅ Posted 10 UPSC-style quiz polls + message + score poll successfully.")
+    print("✅ Posted 10 quiz polls + message + score poll successfully.")
 
 
 if __name__ == "__main__":
