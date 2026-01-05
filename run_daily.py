@@ -10,6 +10,15 @@ from typing import List, Dict, Any, Optional, Tuple
 import requests
 from openai import OpenAI
 
+# ============================================================
+# DAILY CURRENT AFFAIRS MCQ BOT (SSC + PCS) — 10 QUIZ POLLS
+# - Uses only: NextIAS + GKToday + DrishtiIAS
+# - Strictly current: TODAY only (fallback to yesterday only if too few)
+# - No repetition of topics across last N days (by URL + event_key + question)
+# - Easy exam-like framing (SSC/PCS style)
+# - Soft international target (won't crash if intl is low)
+# ============================================================
+
 # -------------------- CONFIG --------------------
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g., @UPPCSSUCCESS
@@ -19,6 +28,13 @@ KEEP_LAST_DAYS = int(os.getenv("KEEP_LAST_DAYS", "15"))
 
 SLEEP_BETWEEN_POLLS = float(os.getenv("SLEEP_BETWEEN_POLLS", "2"))
 SLEEP_AFTER_QUIZ = float(os.getenv("SLEEP_AFTER_QUIZ", "2"))
+
+# HARD CURRENTNESS CONTROLS
+MIN_TODAY_ITEMS = int(os.getenv("MIN_TODAY_ITEMS", "18"))   # if < this, pull yesterday too
+ALLOW_YESTERDAY_FALLBACK = os.getenv("ALLOW_YESTERDAY_FALLBACK", "1") == "1"
+
+# SOFT CONTENT MIX
+MIN_INTL = int(os.getenv("MIN_INTL", "2"))  # soft target only
 
 HISTORY_FILE = "mcq_history.json"
 HTTP_TIMEOUT = 25
@@ -31,7 +47,6 @@ UA = (
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 client = OpenAI()  # reads OPENAI_API_KEY from environment
 
-
 # -------------------- TIME HELPERS --------------------
 def now_ist_date() -> dt.date:
     return (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
@@ -41,7 +56,6 @@ def ist_today_str() -> str:
 
 def ist_yesterday_str() -> str:
     return (now_ist_date() - dt.timedelta(days=1)).isoformat()
-
 
 # -------------------- TELEGRAM HELPERS --------------------
 def tg(method: str, payload: dict) -> dict:
@@ -60,7 +74,6 @@ def tg(method: str, payload: dict) -> dict:
             continue
         raise RuntimeError(f"Telegram error: {data}")
     raise RuntimeError(f"Telegram error after retries: {last_err}")
-
 
 # -------------------- JSON SCHEMA --------------------
 MCQ_ITEM_SCHEMA = {
@@ -94,7 +107,6 @@ MCQ_ITEM_SCHEMA = {
     ],
     "additionalProperties": False,
 }
-
 
 # -------------------- HISTORY --------------------
 def load_history() -> dict:
@@ -149,11 +161,10 @@ def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
         qns.extend(hist["dates"][d].get("question_norms", []))
         uhs.extend(hist["dates"][d].get("url_hashes", []))
 
-    hist["event_keys"] = eks[-600:]
-    hist["question_norms"] = qns[-600:]
-    hist["url_hashes"] = uhs[-1000:]
+    hist["event_keys"] = eks[-900:]
+    hist["question_norms"] = qns[-900:]
+    hist["url_hashes"] = uhs[-1500:]
     return hist
-
 
 # -------------------- HTTP + PARSING --------------------
 def http_get(url: str) -> str:
@@ -213,10 +224,13 @@ def guess_date_from_url(url: str) -> Optional[str]:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return None
 
-def fetch_article_snippet(url: str, max_chars: int = 1200) -> str:
+def fetch_article_snippet(url: str, max_chars: int = 1400) -> Tuple[str, Optional[str]]:
+    """
+    Returns: (snippet_text, published_date_iso_if_found)
+    """
     html = http_get(url)
-    return strip_html(html)[:max_chars]
-
+    pub = extract_meta_date(html) or guess_date_from_url(url)
+    return strip_html(html)[:max_chars], pub
 
 # -------------------- BLOCK META/LISTS --------------------
 BLOCK_TITLE_PHRASES = [
@@ -233,7 +247,6 @@ STATIC_GK_PHRASES = [
     "capital of", "currency of", "highest mountain"
 ]
 BAD_OPTIONS = ["all of the above", "none of the above", "all above", "none"]
-
 
 # -------------------- BAN BANKING/FINANCE (ALLOW ECONOMY MACRO) --------------------
 BANK_FIN_BLOCK = [
@@ -259,8 +272,7 @@ def enforce_no_banking_finance_text(text: str) -> bool:
         return False
     return True
 
-
-# -------------------- INTERNATIONAL MIN 2 --------------------
+# -------------------- INTERNATIONAL DETECTION (ROBUST) --------------------
 INDIA_MARKERS = [
     "india", "indian", "bharat", "new delhi", "delhi", "parliament",
     "uttar pradesh", "bihar", "madhya pradesh", "rajasthan", "gujarat", "maharashtra",
@@ -271,7 +283,7 @@ INDIA_MARKERS = [
 ]
 INTERNATIONAL_MARKERS = [
     "united nations", "un ", "who", "unesco", "imf", "world bank", "wto", "nato",
-    "g20", "brics", "european union", "eu ", "asean", "quad", "opec", "cop"
+    "g20", "brics", "european union", "eu ", "asean", "quad", "opec", "cop", "summit", "treaty"
 ]
 COUNTRY_MARKERS = [
     "usa", "u.s.", "united states", "uk", "britain", "russia", "china", "japan", "france",
@@ -280,14 +292,26 @@ COUNTRY_MARKERS = [
     "sri lanka", "nepal", "bhutan", "thailand", "vietnam", "indonesia", "singapore",
     "egypt", "south africa", "nigeria", "kenya"
 ]
-def is_international_item(title: str, snippet: str) -> bool:
-    txt = f"{title} {snippet}".lower()
-    if any(k in txt for k in INDIA_MARKERS):
-        return False
-    if any(k in txt for k in INTERNATIONAL_MARKERS) or any(k in txt for k in COUNTRY_MARKERS):
-        return True
-    return False
 
+def is_international_item(title: str, snippet: str) -> bool:
+    """
+    Score-based classifier:
+    - If India isn't mentioned, any intl/country marker => international.
+    - If India is mentioned, require stronger intl signal so India+World events still count.
+    """
+    txt = f"{title} {snippet}".lower()
+
+    india_hits = sum(1 for k in INDIA_MARKERS if k in txt)
+    intl_hits = sum(1 for k in INTERNATIONAL_MARKERS if k in txt)
+    country_hits = sum(1 for k in COUNTRY_MARKERS if k in txt)
+
+    strong = (intl_hits + country_hits) >= 1
+
+    if india_hits == 0:
+        return strong
+
+    # India mentioned: need at least 2 global signals
+    return (intl_hits + country_hits) >= 2
 
 # -------------------- SOURCES (ONLY YOUR 3) --------------------
 def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
@@ -304,6 +328,7 @@ def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
             if not title:
                 continue
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            # accept today only here (unknown allowed); strictness happens later using page pub
             if pub == date_iso or pub == "":
                 items.append({"source": "NextIAS", "url": url, "title": title, "date": pub or date_iso})
         except Exception:
@@ -315,7 +340,7 @@ def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
     html = http_get(base)
     links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
     links = [u for u in links if "wp-content" not in u]
-    links = list(dict.fromkeys(links))[:220]
+    links = list(dict.fromkeys(links))[:240]
     items = []
     for url in links:
         try:
@@ -354,6 +379,9 @@ def collect_drishtiias(date_iso: str) -> List[Dict[str, str]]:
     return items
 
 def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Strictly prefers TODAY. Only uses yesterday if too few today items AND fallback enabled.
+    """
     today = ist_today_str()
     yesterday = ist_yesterday_str()
     sources = [collect_nextias, collect_gktoday, collect_drishtiias]
@@ -369,15 +397,17 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
 
     # Dedup by URL
     seen = set()
-    dedup = []
+    dedup_today = []
     for it in all_today:
         h = _url_hash(it["url"])
         if h not in seen:
             seen.add(h)
-            dedup.append(it)
+            dedup_today.append(it)
 
-    # Fallback yesterday if too low
-    if len(dedup) < 16:
+    # Only fallback if too few
+    dedup = list(dedup_today)
+    if ALLOW_YESTERDAY_FALLBACK and len(dedup_today) < MIN_TODAY_ITEMS:
+        print(f"⚠️ Only {len(dedup_today)} items for today. Trying yesterday fallback...")
         all_yday = []
         for fn in sources:
             try:
@@ -394,35 +424,27 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
 
     return today, dedup
 
-
 # -------------------- EXAM-LIKE EASY FRAMING CHECKS --------------------
 def is_exam_style_easy(qtext: str) -> bool:
-    """
-    Enforce direct exam-like MCQ framing.
-    """
     t = (qtext or "").strip()
     low = t.lower()
 
     if not t.endswith("?"):
         return False
 
-    # Must start like an actual objective MCQ
     starters = ("which", "what", "who", "where", "when")
     if not low.startswith(starters):
         return False
 
-    # Reject UPSC statement pattern
     if low.startswith(("with reference to", "consider the following statements")):
         return False
 
-    # Reject meta/section questions
     if "section" in low or "category" in low:
         return False
     if any(p in low for p in VAGUE_PHRASES):
         return False
 
     return True
-
 
 def extract_title_entities(title: str) -> List[str]:
     t = title or ""
@@ -442,11 +464,7 @@ def extract_title_entities(title: str) -> List[str]:
     entities.sort(key=len, reverse=True)
     return entities[:8]
 
-
 def contains_entity_relaxed(mcq: Dict[str, Any], entities: List[str]) -> bool:
-    """
-    Keep anchoring, but don't kill everything when entities are weak.
-    """
     if not entities:
         return True
     joined = (
@@ -456,7 +474,6 @@ def contains_entity_relaxed(mcq: Dict[str, Any], entities: List[str]) -> bool:
     ).lower()
     return any(e.lower() in joined for e in entities)
 
-
 def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     q = (mcq.get("question") or "")
     opts = mcq.get("options") or []
@@ -465,32 +482,25 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
 
     qlow = q.lower()
 
-    # No meta/list pages
     if any(p in title for p in BLOCK_TITLE_PHRASES):
         return False
 
-    # No vague/meta questions
     if any(v in qlow for v in VAGUE_PHRASES):
         return False
 
-    # No static GK
     if any(p in qlow for p in STATIC_GK_PHRASES):
         return False
 
-    # No "All/None"
     if any(_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS] for o in opts):
         return False
 
-    # Must be exam-like easy framing
     if not is_exam_style_easy(q):
         return False
 
-    # No banking/finance
     joined = (q + " " + " ".join(opts) + " " + exp)
     if not enforce_no_banking_finance_text(joined):
         return False
 
-    # Options checks
     if len(opts) != 4:
         return False
     if len(set(_norm_text(o) for o in opts)) != 4:
@@ -500,18 +510,16 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     if ca not in opts:
         return False
 
-    # Anchoring (relaxed)
     if not contains_entity_relaxed(mcq, title_entities):
         return False
 
     return True
 
-
 # -------------------- MCQ GENERATION --------------------
 def generate_one_mcq_from_article(
     article: Dict[str, Any],
     avoid_event_keys: List[str],
-    avoid_qnorms: List[str]
+    avoid_qnorms: List[str],
 ) -> Optional[Dict[str, Any]]:
     title = article["title"]
     url = article["url"]
@@ -519,13 +527,13 @@ def generate_one_mcq_from_article(
     entities = extract_title_entities(title)
 
     system = (
-        "You create EASY, exam-like Current Affairs MCQs.\n"
+        "You create EASY, exam-like Current Affairs MCQs for SSC/PCS.\n"
         "STRICT RULES:\n"
         "- Use ONLY the given title + snippet. Do NOT add outside facts.\n"
         "- Question MUST be direct like real exams.\n"
         "- Start with Which/What/Who/Where/When and end with '?'.\n"
         "- Do NOT use: 'With reference to' or 'Consider the following statements'.\n"
-        "- Do NOT ask meta questions about sections/categories (Important Days/Appointments etc.).\n"
+        "- Do NOT ask meta questions about sections/categories.\n"
         "- Do NOT use 'All of the above'/'None of the above'.\n"
         "- Avoid Banking/Finance (RBI/SEBI/UPI/banks/markets). Economy macro is allowed.\n"
         "- Options must be short, factual, and same-category.\n"
@@ -540,8 +548,8 @@ def generate_one_mcq_from_article(
         "source_url": url,
         "snippet": snippet,
         "anchor_entities_hint": entities[:6],
-        "avoid_event_keys_norm": avoid_event_keys[:250],
-        "avoid_question_norms": avoid_qnorms[:250],
+        "avoid_event_keys_norm": avoid_event_keys[:350],
+        "avoid_question_norms": avoid_qnorms[:350],
     }
 
     resp = client.responses.create(
@@ -562,7 +570,6 @@ def generate_one_mcq_from_article(
 
     mcq = json.loads(resp.output_text)
 
-    # force source fields
     mcq["source"] = article["source"]
     mcq["source_title"] = title[:200]
     mcq["source_url"] = url[:400]
@@ -577,21 +584,20 @@ def generate_one_mcq_from_article(
 
     return mcq
 
-
 def generate_mcq_set() -> Dict[str, Any]:
     today_label, items = collect_fresh_items()
-    if len(items) < 8:
+    if len(items) < 10:
         raise RuntimeError(f"Not enough items from sources. Found {len(items)}.")
 
     hist = load_history()
-    used_url_hashes = set(hist.get("url_hashes", [])[-1000:])
-    used_event_keys = [_norm_text(x) for x in (hist.get("event_keys", [])[-600:])]
-    used_qnorms = hist.get("question_norms", [])[-600:]
+    used_url_hashes = set(hist.get("url_hashes", [])[-1500:])
+    used_event_keys = [_norm_text(x) for x in (hist.get("event_keys", [])[-900:])]
+    used_qnorms = hist.get("question_norms", [])[-900:]
 
     pool = []
     seen_title = set()
 
-    for it in items[:220]:
+    for it in items[:260]:
         uh = _url_hash(it["url"])
         if uh in used_url_hashes:
             continue
@@ -605,23 +611,37 @@ def generate_mcq_set() -> Dict[str, Any]:
         if any(p in title_low for p in BLOCK_TITLE_PHRASES):
             continue
 
+        # Fetch snippet + discover actual publish date
         try:
-            snippet = fetch_article_snippet(it["url"], max_chars=1400)
+            snippet, pub = fetch_article_snippet(it["url"], max_chars=1400)
         except Exception:
-            snippet = ""
+            snippet, pub = "", None
 
-        # block banking/finance articles
-        if any(k in (it["title"] + " " + snippet).lower() for k in BANK_FIN_BLOCK) and not any(k in (it["title"] + " " + snippet).lower() for k in ECON_ALLOW):
+        # STRICT CURRENTNESS:
+        # If pub exists and it's neither today nor yesterday (only if fallback enabled), reject.
+        if pub:
+            if pub != today_label:
+                if not (ALLOW_YESTERDAY_FALLBACK and pub == ist_yesterday_str()):
+                    continue
+
+        joined_low = (it["title"] + " " + snippet).lower()
+
+        # block banking/finance articles (allow macro economy)
+        if any(k in joined_low for k in BANK_FIN_BLOCK) and not any(k in joined_low for k in ECON_ALLOW):
             continue
 
         pool.append({
             **it,
             "snippet": snippet,
+            "pub": pub or it.get("date") or today_label,
             "is_international": is_international_item(it["title"], snippet),
         })
 
     if len(pool) < 10:
-        raise RuntimeError(f"Not enough usable articles after filters. Found {len(pool)}.")
+        raise RuntimeError(f"Not enough usable articles after strict currentness + filters. Found {len(pool)}.")
+
+    print("🧾 Pool size:", len(pool))
+    print("🌍 Intl candidates in pool:", sum(1 for a in pool if a.get("is_international")))
 
     rnd = random.Random(today_label)
     rnd.shuffle(pool)
@@ -632,19 +652,16 @@ def generate_mcq_set() -> Dict[str, Any]:
     seen_url = set(used_url_hashes)
 
     intl_count = 0
-    MIN_INTL = 2
-
-    max_attempts = 220
+    max_attempts = 260
     attempts = 0
 
-    # ensure 2 international first (if available)
+    # 1) Try to pick international first (soft target)
     for art in pool:
-        if intl_count >= MIN_INTL:
-            break
-        if len(out) >= 10:
+        if intl_count >= MIN_INTL or len(out) >= 10:
             break
         if not art.get("is_international", False):
             continue
+
         attempts += 1
         if attempts > max_attempts:
             break
@@ -663,10 +680,11 @@ def generate_mcq_set() -> Dict[str, Any]:
         out.append(mcq)
         intl_count += 1
 
-    # fill remaining from any
+    # 2) Fill remaining with any
     for art in pool:
         if len(out) >= 10:
             break
+
         attempts += 1
         if attempts > max_attempts:
             break
@@ -686,12 +704,18 @@ def generate_mcq_set() -> Dict[str, Any]:
         if art.get("is_international", False):
             intl_count += 1
 
-    # Quality over quantity: do not crash the bot if sources are thin today
-    if len(out) < 6:
-        raise RuntimeError(f"Too few quality MCQs today. Got {len(out)}.")
-    # still try to keep 2 international if possible, but don't crash if sources didn't provide
-    return {"date": today_label, "mcqs": out[:10]}
+    # Ensure we produce 10 daily (or fail clearly)
+    if len(out) < 10:
+        raise RuntimeError(
+            f"Could not build 10 fresh, current SSC/PCS MCQs today. Got {len(out)}. "
+            f"Try increasing MIN_TODAY_ITEMS fallback, or allow yesterday fallback."
+        )
 
+    # Soft intl warning only (no crash)
+    if intl_count < MIN_INTL:
+        print(f"⚠️ Intl shortfall: needed {MIN_INTL}, got {intl_count}. Proceeding anyway.")
+
+    return {"date": today_label, "mcqs": out[:10]}
 
 # -------------------- QUIZ POSTING --------------------
 def shuffle_options_and_fix_answer(q: dict) -> dict:
@@ -708,7 +732,7 @@ def shuffle_options_and_fix_answer(q: dict) -> dict:
 
 def post_competitive_closure_message():
     text = (
-        "🏁 Today’s Challenge Ends Here!\n\n"
+        "🏁 Today’s Practice Ends Here!\n\n"
         "Comment your score below 👇\n"
         "Let’s see how many 8+ scorers we have today 🔥\n\n"
         "⏰ Back tomorrow at the same time."
@@ -726,7 +750,7 @@ def post_score_poll(date_str: str):
     tg("sendPoll", payload)
 
 def post_to_channel(mcq_set: dict):
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\nMCQ polls below 👇"})
+    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Practice (SSC/PCS) ({mcq_set['date']})\n\nMCQ polls below 👇"})
     for i, q in enumerate(mcq_set["mcqs"], start=1):
         q = shuffle_options_and_fix_answer(q)
         payload = {
@@ -753,7 +777,6 @@ def post_to_channel(mcq_set: dict):
     except Exception as e:
         print("❌ Failed to post score poll:", e)
 
-
 # -------------------- MAIN --------------------
 def main():
     mcq_set = generate_mcq_set()
@@ -763,7 +786,7 @@ def main():
     hist = update_history(hist, mcq_set, keep_last_days=KEEP_LAST_DAYS)
     save_history(hist)
 
-    print("✅ Posted quiz polls + message + score poll successfully.")
+    print("✅ Posted 10 quiz polls + closure message + score poll successfully.")
 
 if __name__ == "__main__":
     main()
