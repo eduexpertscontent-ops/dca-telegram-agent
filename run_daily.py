@@ -274,7 +274,9 @@ def normalize_date_to_yyyy_mm_dd(raw: str) -> Optional[str]:
 
 
 def now_ist_date() -> dt.date:
-    return (dt.datetime.utcnow() + IST_OFFSET).date()
+    # timezone-aware UTC -> IST date
+    return (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
+
 
 
 def ist_today_str() -> str:
