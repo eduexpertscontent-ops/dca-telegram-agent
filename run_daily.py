@@ -715,13 +715,9 @@ def main():
     date_str, mcqs, used_urls, used_fact_hashes, used_q_hashes = build_daily_mcqs()
 
     if not mcqs:
-        msg = (
-            f"⚠️ Could not generate MCQs for {date_str}.\n"
-            "Reason: sources might be unavailable/changed today.\n"
-            "I will try again tomorrow automatically."
-        )
-        print(msg)
-        post_info(msg)
+        # No source links, no technical details in Telegram
+        print(f"⚠️ Could not generate MCQs for {date_str}. Will try again tomorrow.")
+        post_info(f"⚠️ Today’s Current Affairs MCQs could not be generated ({date_str}).\nTry again tomorrow ✅")
         return
 
     # post whatever we got; don't crash if less than MIN_POLLS_TO_POST
@@ -736,3 +732,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
