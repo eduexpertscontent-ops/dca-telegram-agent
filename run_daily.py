@@ -31,6 +31,7 @@ UA = (
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 client = OpenAI()  # reads OPENAI_API_KEY from environment
 
+
 # -------------------- TIME HELPERS --------------------
 def now_ist_date() -> dt.date:
     return (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
@@ -66,18 +67,19 @@ MCQ_ITEM_SCHEMA = {
     "type": "object",
     "properties": {
         "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
-        "question": {"type": "string", "minLength": 1, "maxLength": 320},
+        "question": {"type": "string", "minLength": 1, "maxLength": 260},
         "options": {
             "type": "array",
             "minItems": 4,
             "maxItems": 4,
-            "items": {"type": "string", "minLength": 1, "maxLength": 120},
+            "items": {"type": "string", "minLength": 1, "maxLength": 80},
         },
         "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
-        "correct_answer": {"type": "string", "minLength": 1, "maxLength": 120},
-        "explanation": {"type": "string", "maxLength": 220},
+        "correct_answer": {"type": "string", "minLength": 1, "maxLength": 80},
+        "explanation": {"type": "string", "maxLength": 200},
         "source_url": {"type": "string", "minLength": 5, "maxLength": 400},
         "source_title": {"type": "string", "minLength": 3, "maxLength": 200},
+        "source": {"type": "string", "minLength": 2, "maxLength": 40},
     },
     "required": [
         "event_key",
@@ -88,12 +90,13 @@ MCQ_ITEM_SCHEMA = {
         "explanation",
         "source_url",
         "source_title",
+        "source",
     ],
     "additionalProperties": False,
 }
 
 
-# -------------------- HISTORY (NO-REPEAT ACROSS DAYS) --------------------
+# -------------------- HISTORY --------------------
 def load_history() -> dict:
     if not os.path.exists(HISTORY_FILE):
         return {"dates": {}, "event_keys": [], "question_norms": [], "url_hashes": []}
@@ -152,7 +155,7 @@ def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
     return hist
 
 
-# -------------------- HTTP + LIGHT HTML PARSING --------------------
+# -------------------- HTTP + PARSING --------------------
 def http_get(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -184,11 +187,6 @@ def normalize_date_to_yyyy_mm_dd(raw: str) -> Optional[str]:
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    m = re.match(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", raw)
-    if m:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1 <= mo <= 12 and 1 <= d <= 31:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
     return None
 
 def extract_meta_date(html: str) -> Optional[str]:
@@ -196,10 +194,6 @@ def extract_meta_date(html: str) -> Optional[str]:
     m = re.search(r'property=["\']article:published_time["\']\s+content=["\']([^"\']+)["\']', html, re.I)
     if m:
         candidates.append(m.group(1))
-    for name in ["publish-date", "date", "parsely-pub-date", "pubdate", "DC.date.issued"]:
-        m = re.search(rf'name=["\']{re.escape(name)}["\']\s+content=["\']([^"\']+)["\']', html, re.I)
-        if m:
-            candidates.append(m.group(1))
     m = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)
     if m:
         candidates.append(m.group(1))
@@ -219,26 +213,26 @@ def guess_date_from_url(url: str) -> Optional[str]:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return None
 
-def fetch_article_snippet(url: str, max_chars: int = 1100) -> str:
+def fetch_article_snippet(url: str, max_chars: int = 1200) -> str:
     html = http_get(url)
     return strip_html(html)[:max_chars]
 
 
-# -------------------- SOURCE FILTERS (BLOCK META/LISTS) --------------------
+# -------------------- BLOCK META/LISTS --------------------
 BLOCK_TITLE_PHRASES = [
-    # Meta / category / list pages
-    "important days", "appointments", "current affairs section",
-    "daily current affairs pdf", "today current affairs pdf", "current affairs pdf",
-    "weekly current affairs", "monthly current affairs", "capsule", "compilation",
-    "mcq", "quiz", "practice questions", "questions and answers",
-    "obituary current affairs",
-    "year 2026", "2026 important days", "2026 appointments",
+    "important days", "appointments", "current affairs pdf", "weekly current affairs",
+    "monthly current affairs", "capsule", "compilation", "quiz", "mcq", "practice questions",
+    "questions and answers", "obituary current affairs", "year 2026",
 ]
-
+VAGUE_PHRASES = [
+    "recently concluded", "significant conference", "took place recently",
+    "what kind of events", "what is the focus of", "section cover", "section covers",
+]
 STATIC_GK_PHRASES = [
     "queen of the hills", "national anthem", "national animal", "largest planet",
     "capital of", "currency of", "highest mountain"
 ]
+BAD_OPTIONS = ["all of the above", "none of the above", "all above", "none"]
 
 
 # -------------------- BAN BANKING/FINANCE (ALLOW ECONOMY MACRO) --------------------
@@ -250,35 +244,35 @@ BANK_FIN_BLOCK = [
     "mutual fund", "ipo", "share market", "stock", "stocks", "bond", "g-sec", "treasury bill", "forex",
     "microfinance", "fintech", "insurance premium",
 ]
-
 ECON_ALLOW = [
     "gdp", "inflation", "cpi", "wpi", "fiscal", "budget", "tax", "gst",
     "subsidy", "trade", "export", "import", "current account", "cad",
     "poverty", "employment", "unemployment", "agriculture", "msp",
 ]
 
-def is_banking_finance_related(title: str, snippet: str) -> bool:
-    txt = f"{title} {snippet}".lower()
-    hit_bank = any(k in txt for k in BANK_FIN_BLOCK)
-    hit_econ = any(k in txt for k in ECON_ALLOW)
-    return hit_bank and not hit_econ
+def enforce_no_banking_finance_text(text: str) -> bool:
+    low = (text or "").lower()
+    if any(k in low for k in BANK_FIN_BLOCK):
+        # allow macro economy keywords, but still block RBI/SEBI/UPI etc.
+        if any(k in low for k in ECON_ALLOW) and not any(x in low for x in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
+            return True
+        return False
+    return True
 
 
 # -------------------- INTERNATIONAL MIN 2 --------------------
 INDIA_MARKERS = [
-    "india", "indian", "bharat", "new delhi", "delhi", "parliament", "lok sabha", "rajya sabha",
+    "india", "indian", "bharat", "new delhi", "delhi", "parliament",
     "uttar pradesh", "bihar", "madhya pradesh", "rajasthan", "gujarat", "maharashtra",
     "tamil nadu", "karnataka", "kerala", "west bengal", "odisha", "telangana", "andhra pradesh",
     "punjab", "haryana", "jharkhand", "chhattisgarh", "assam", "sikkim", "goa", "ladakh",
-    "jammu", "kashmir", "lakshadweep", "andaman", "nicobar", "chandigarh", "puducherry",
+    "jammu", "kashmir", "lakshadweep", "andaman", "nicobar",
     "supreme court", "isro", "drdo", "ministry of", "cabinet", "pm modi"
 ]
-
 INTERNATIONAL_MARKERS = [
     "united nations", "un ", "who", "unesco", "imf", "world bank", "wto", "nato",
     "g20", "brics", "european union", "eu ", "asean", "quad", "opec", "cop"
 ]
-
 COUNTRY_MARKERS = [
     "usa", "u.s.", "united states", "uk", "britain", "russia", "china", "japan", "france",
     "germany", "canada", "mexico", "brazil", "australia", "south korea", "north korea",
@@ -286,7 +280,6 @@ COUNTRY_MARKERS = [
     "sri lanka", "nepal", "bhutan", "thailand", "vietnam", "indonesia", "singapore",
     "egypt", "south africa", "nigeria", "kenya"
 ]
-
 def is_international_item(title: str, snippet: str) -> bool:
     txt = f"{title} {snippet}".lower()
     if any(k in txt for k in INDIA_MARKERS):
@@ -300,11 +293,9 @@ def is_international_item(title: str, snippet: str) -> bool:
 def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.nextias.com/daily-current-affairs"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://www\.nextias\.com/daily-current-affairs/[^"\']+)["\']', html, re.I)
     links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
-    links = list(dict.fromkeys(links))[:160]
-
+    links = list(dict.fromkeys(links))[:180]
     items = []
     for url in links:
         try:
@@ -313,22 +304,18 @@ def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
             if not title:
                 continue
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            # accept today OR unknown (NextIAS often hides clean date)
             if pub == date_iso or pub == "":
                 items.append({"source": "NextIAS", "url": url, "title": title, "date": pub or date_iso})
         except Exception:
             continue
     return items
 
-
 def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.gktoday.in/current-affairs/"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
     links = [u for u in links if "wp-content" not in u]
-    links = list(dict.fromkeys(links))[:180]
-
+    links = list(dict.fromkeys(links))[:220]
     items = []
     for url in links:
         try:
@@ -337,25 +324,21 @@ def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
             if not title:
                 continue
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            # accept today OR unknown (GKToday sometimes not easy)
             if pub == date_iso or pub == "":
                 items.append({"source": "GKToday", "url": url, "title": title, "date": pub or date_iso})
         except Exception:
             continue
     return items
 
-
 def collect_drishtiias(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.drishtiias.com/current-affairs-news-analysis-editorials"
     html = http_get(base)
-
     links = re.findall(
         r'href=["\'](https://www\.drishtiias\.com/current-affairs-news-analysis-editorials/[^"\']+)["\']',
         html, re.I
     )
     links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
-    links = list(dict.fromkeys(links))[:220]
-
+    links = list(dict.fromkeys(links))[:260]
     items = []
     for url in links:
         try:
@@ -370,11 +353,9 @@ def collect_drishtiias(date_iso: str) -> List[Dict[str, str]]:
             continue
     return items
 
-
 def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
     today = ist_today_str()
     yesterday = ist_yesterday_str()
-
     sources = [collect_nextias, collect_gktoday, collect_drishtiias]
 
     all_today = []
@@ -396,7 +377,7 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
             dedup.append(it)
 
     # Fallback yesterday if too low
-    if len(dedup) < 20:
+    if len(dedup) < 16:
         all_yday = []
         for fn in sources:
             try:
@@ -414,115 +395,102 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
     return today, dedup
 
 
-# -------------------- QUALITY GUARDS --------------------
-VAGUE_PHRASES = [
-    "recently concluded", "significant conference", "took place recently",
-    "what kind of events", "what is the focus of", "section cover", "section covers"
-]
+# -------------------- EXAM-LIKE EASY FRAMING CHECKS --------------------
+def is_exam_style_easy(qtext: str) -> bool:
+    """
+    Enforce direct exam-like MCQ framing.
+    """
+    t = (qtext or "").strip()
+    low = t.lower()
 
-BAD_OPTIONS = ["all of the above", "none of the above", "all above", "none"]
+    if not t.endswith("?"):
+        return False
+
+    # Must start like an actual objective MCQ
+    starters = ("which", "what", "who", "where", "when")
+    if not low.startswith(starters):
+        return False
+
+    # Reject UPSC statement pattern
+    if low.startswith(("with reference to", "consider the following statements")):
+        return False
+
+    # Reject meta/section questions
+    if "section" in low or "category" in low:
+        return False
+    if any(p in low for p in VAGUE_PHRASES):
+        return False
+
+    return True
+
 
 def extract_title_entities(title: str) -> List[str]:
     t = title or ""
     entities = set()
 
-    for m in re.findall(r"\b[A-Z]{2,}\b", t):
-        entities.add(m)
-
-    for m in re.findall(r"\b[A-Za-z]+[-–][A-Za-z0-9]+\b", t):
-        entities.add(m)
-
     for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", t):
+        entities.add(m)
+
+    for m in re.findall(r"\b[A-Z]{2,}\b", t):
         entities.add(m)
 
     for m in re.findall(r"\b[A-Z][a-z]{3,}\b", t):
         entities.add(m)
 
-    stop = {
-        "India", "Indian", "January", "February", "March", "April", "May", "June", "July",
-        "August", "September", "October", "November", "December", "Government", "Ministry"
-    }
+    stop = {"India", "Indian", "Government", "Ministry"}
     entities = [e for e in entities if e not in stop and len(e) >= 4]
     entities.sort(key=len, reverse=True)
-    return entities[:10]
+    return entities[:8]
 
-def contains_any_entity_anywhere(mcq: Dict[str, Any], entities: List[str]) -> bool:
+
+def contains_entity_relaxed(mcq: Dict[str, Any], entities: List[str]) -> bool:
+    """
+    Keep anchoring, but don't kill everything when entities are weak.
+    """
     if not entities:
-        # If we couldn't extract entities, do not kill the MCQ (avoid "Got 0" situation)
         return True
-    joined = (mcq.get("question") or "") + " " + " ".join(mcq.get("options") or []) + " " + (mcq.get("explanation") or "")
-    low = joined.lower()
-    return any(e.lower() in low for e in entities)
+    joined = (
+        (mcq.get("question") or "") + " " +
+        " ".join(mcq.get("options") or []) + " " +
+        (mcq.get("explanation") or "")
+    ).lower()
+    return any(e.lower() in joined for e in entities)
 
-def is_exam_style(qtext: str) -> bool:
-    """
-    Accept BOTH:
-    - Direct objective style (SSC/PCS)
-    - UPSC statement style (your "UPSC level" ask)
-    """
-    t = (qtext or "").strip().lower()
-    if not t:
-        return False
-    # must end with ? OR contain statement pattern
-    if t.endswith("?"):
-        return True
-    if t.startswith("with reference to") or t.startswith("consider the following statements"):
-        return True
-    return False
-
-def enforce_no_banking_finance_text(text: str) -> bool:
-    low = (text or "").lower()
-    if any(k in low for k in BANK_FIN_BLOCK):
-        # allow macro economy keywords, but still block RBI/SEBI/UPI etc.
-        if any(k in low for k in ECON_ALLOW) and not any(x in low for x in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
-            return True
-        return False
-    return True
 
 def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     q = (mcq.get("question") or "")
     opts = mcq.get("options") or []
     exp = mcq.get("explanation") or ""
     title = (mcq.get("source_title") or "").lower()
+
     qlow = q.lower()
 
-    # HARD BAN: meta/website-structure questions (Important Days/Appointments section type)
-    META_Q_PATTERNS = [
-        "important days", "appointments current affairs", "current affairs section",
-        "section cover", "section covers", "what kind of events does",
-        "what is the focus of", "this section", "the section",
-    ]
-    if any(p in qlow for p in META_Q_PATTERNS):
-        return False
-    if "section" in qlow or "category" in qlow:
-        return False
-
-    # no meta/list pages by title
+    # No meta/list pages
     if any(p in title for p in BLOCK_TITLE_PHRASES):
         return False
 
-    # no vague/meta questions
+    # No vague/meta questions
     if any(v in qlow for v in VAGUE_PHRASES):
         return False
 
-    # no static GK patterns
+    # No static GK
     if any(p in qlow for p in STATIC_GK_PHRASES):
         return False
 
-    # no all/none options
+    # No "All/None"
     if any(_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS] for o in opts):
         return False
 
-    # exam style: allow direct or UPSC statement style
-    if not is_exam_style(q):
+    # Must be exam-like easy framing
+    if not is_exam_style_easy(q):
         return False
 
-    # banking/finance ban
+    # No banking/finance
     joined = (q + " " + " ".join(opts) + " " + exp)
     if not enforce_no_banking_finance_text(joined):
         return False
 
-    # options checks
+    # Options checks
     if len(opts) != 4:
         return False
     if len(set(_norm_text(o) for o in opts)) != 4:
@@ -532,14 +500,14 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     if ca not in opts:
         return False
 
-    # entity anchoring (relaxed + checks in question+options+explanation)
-    if not contains_any_entity_anywhere(mcq, title_entities):
+    # Anchoring (relaxed)
+    if not contains_entity_relaxed(mcq, title_entities):
         return False
 
     return True
 
 
-# -------------------- MCQ GENERATION (ONE ARTICLE -> ONE MCQ) --------------------
+# -------------------- MCQ GENERATION --------------------
 def generate_one_mcq_from_article(
     article: Dict[str, Any],
     avoid_event_keys: List[str],
@@ -551,26 +519,27 @@ def generate_one_mcq_from_article(
     entities = extract_title_entities(title)
 
     system = (
-        "You are a high-quality Current Affairs MCQ setter for UPSC/State PCS/SSC-level exams.\n"
-        "Write ONE exam-standard MCQ from the provided evidence.\n"
-        "STRICT:\n"
-        "- Use ONLY the provided title+snippet. Do NOT add outside facts.\n"
-        "- The question must be anchored to the article (use a key term/name/organisation/place).\n"
-        "- You MAY use UPSC-style statement framing (With reference to / Consider the following statements).\n"
-        "- Do NOT make meta questions about sections/categories (Important Days/Appointments etc.).\n"
+        "You create EASY, exam-like Current Affairs MCQs.\n"
+        "STRICT RULES:\n"
+        "- Use ONLY the given title + snippet. Do NOT add outside facts.\n"
+        "- Question MUST be direct like real exams.\n"
+        "- Start with Which/What/Who/Where/When and end with '?'.\n"
+        "- Do NOT use: 'With reference to' or 'Consider the following statements'.\n"
+        "- Do NOT ask meta questions about sections/categories (Important Days/Appointments etc.).\n"
         "- Do NOT use 'All of the above'/'None of the above'.\n"
-        "- Do NOT create Banking/Finance CA (RBI/SEBI/UPI/repo/banks/markets). Macro economy allowed.\n"
-        "- Options must be plausible and same-category.\n"
+        "- Avoid Banking/Finance (RBI/SEBI/UPI/banks/markets). Economy macro is allowed.\n"
+        "- Options must be short, factual, and same-category.\n"
         "- correct_answer must exactly match one option; correct_option_id must match.\n"
-        "- Explanation <= 220 chars.\n"
-        "- event_key must be a short unique identifier (3–10 words) for this event.\n"
+        "- Explanation <= 200 characters.\n"
+        "- event_key must be a short unique identifier (3–10 words).\n"
     )
 
     user = {
+        "source": article["source"],
         "source_title": title,
         "source_url": url,
         "snippet": snippet,
-        "anchor_entities_hint": entities[:8],
+        "anchor_entities_hint": entities[:6],
         "avoid_event_keys_norm": avoid_event_keys[:250],
         "avoid_question_norms": avoid_qnorms[:250],
     }
@@ -584,7 +553,7 @@ def generate_one_mcq_from_article(
         text={
             "format": {
                 "type": "json_schema",
-                "name": "single_mcq",
+                "name": "single_easy_exam_mcq",
                 "strict": True,
                 "schema": MCQ_ITEM_SCHEMA,
             }
@@ -592,6 +561,9 @@ def generate_one_mcq_from_article(
     )
 
     mcq = json.loads(resp.output_text)
+
+    # force source fields
+    mcq["source"] = article["source"]
     mcq["source_title"] = title[:200]
     mcq["source_url"] = url[:400]
 
@@ -608,8 +580,8 @@ def generate_one_mcq_from_article(
 
 def generate_mcq_set() -> Dict[str, Any]:
     today_label, items = collect_fresh_items()
-    if len(items) < 10:
-        raise RuntimeError(f"Not enough fresh items from sources. Found {len(items)}.")
+    if len(items) < 8:
+        raise RuntimeError(f"Not enough items from sources. Found {len(items)}.")
 
     hist = load_history()
     used_url_hashes = set(hist.get("url_hashes", [])[-1000:])
@@ -619,7 +591,7 @@ def generate_mcq_set() -> Dict[str, Any]:
     pool = []
     seen_title = set()
 
-    for it in items[:200]:
+    for it in items[:220]:
         uh = _url_hash(it["url"])
         if uh in used_url_hashes:
             continue
@@ -638,7 +610,8 @@ def generate_mcq_set() -> Dict[str, Any]:
         except Exception:
             snippet = ""
 
-        if is_banking_finance_related(it["title"], snippet):
+        # block banking/finance articles
+        if any(k in (it["title"] + " " + snippet).lower() for k in BANK_FIN_BLOCK) and not any(k in (it["title"] + " " + snippet).lower() for k in ECON_ALLOW):
             continue
 
         pool.append({
@@ -647,7 +620,7 @@ def generate_mcq_set() -> Dict[str, Any]:
             "is_international": is_international_item(it["title"], snippet),
         })
 
-    if len(pool) < 12:
+    if len(pool) < 10:
         raise RuntimeError(f"Not enough usable articles after filters. Found {len(pool)}.")
 
     rnd = random.Random(today_label)
@@ -661,64 +634,62 @@ def generate_mcq_set() -> Dict[str, Any]:
     intl_count = 0
     MIN_INTL = 2
 
-    max_attempts = 160
+    max_attempts = 220
     attempts = 0
 
-    # First, ensure international minimum
+    # ensure 2 international first (if available)
     for art in pool:
-        if len(out) >= 10:
-            break
         if intl_count >= MIN_INTL:
             break
-        attempts += 1
-        if attempts > max_attempts:
+        if len(out) >= 10:
             break
         if not art.get("is_international", False):
             continue
-        uh = _url_hash(art["url"])
-        if uh in seen_url:
-            continue
+        attempts += 1
+        if attempts > max_attempts:
+            break
+
         mcq = generate_one_mcq_from_article(art, list(seen_event), list(seen_q))
         if not mcq:
             continue
+
         ek = _norm_text(mcq["event_key"])
         qn = _norm_text(mcq["question"])
         uh2 = _url_hash(mcq["source_url"])
         if ek in seen_event or qn in seen_q or uh2 in seen_url:
             continue
+
         seen_event.add(ek); seen_q.add(qn); seen_url.add(uh2)
         out.append(mcq)
         intl_count += 1
 
-    # Then fill remaining with any (national + international mixed, exam-relevant)
-    attempts2 = 0
+    # fill remaining from any
     for art in pool:
         if len(out) >= 10:
             break
-        attempts2 += 1
-        if attempts2 > max_attempts:
+        attempts += 1
+        if attempts > max_attempts:
             break
-        uh = _url_hash(art["url"])
-        if uh in seen_url:
-            continue
+
         mcq = generate_one_mcq_from_article(art, list(seen_event), list(seen_q))
         if not mcq:
             continue
+
         ek = _norm_text(mcq["event_key"])
         qn = _norm_text(mcq["question"])
         uh2 = _url_hash(mcq["source_url"])
         if ek in seen_event or qn in seen_q or uh2 in seen_url:
             continue
+
         seen_event.add(ek); seen_q.add(qn); seen_url.add(uh2)
         out.append(mcq)
         if art.get("is_international", False):
             intl_count += 1
 
-    if len(out) < 10:
-        raise RuntimeError(f"Could not build 10 high-quality anchored MCQs. Got {len(out)}.")
-    if intl_count < MIN_INTL:
-        raise RuntimeError(f"Could not reach {MIN_INTL} international MCQs. Got {intl_count}.")
-
+    # Quality over quantity: do not crash the bot if sources are thin today
+    if len(out) < 6:
+        raise RuntimeError(f"Too few quality MCQs today. Got {len(out)}.")
+    # still try to keep 2 international if possible, but don't crash if sources didn't provide
     return {"date": today_label, "mcqs": out[:10]}
 
 
@@ -755,7 +726,7 @@ def post_score_poll(date_str: str):
     tg("sendPoll", payload)
 
 def post_to_channel(mcq_set: dict):
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇"})
+    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\nMCQ polls below 👇"})
     for i, q in enumerate(mcq_set["mcqs"], start=1):
         q = shuffle_options_and_fix_answer(q)
         payload = {
@@ -792,7 +763,7 @@ def main():
     hist = update_history(hist, mcq_set, keep_last_days=KEEP_LAST_DAYS)
     save_history(hist)
 
-    print("✅ Posted 10 quiz polls + message + score poll successfully.")
+    print("✅ Posted quiz polls + message + score poll successfully.")
 
 if __name__ == "__main__":
     main()
