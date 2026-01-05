@@ -31,16 +31,12 @@ UA = (
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 client = OpenAI()  # reads OPENAI_API_KEY from environment
 
-
 # -------------------- TIME HELPERS --------------------
 def now_ist_date() -> dt.date:
-    # timezone-aware UTC -> IST date (fixes utcnow warning)
     return (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
-
 
 def ist_today_str() -> str:
     return now_ist_date().isoformat()
-
 
 def ist_yesterday_str() -> str:
     return (now_ist_date() - dt.timedelta(days=1)).isoformat()
@@ -50,66 +46,57 @@ def ist_yesterday_str() -> str:
 def tg(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     last_err = None
-
     for _ in range(4):
         r = requests.post(url, json=payload, timeout=30)
         data = r.json()
-
         if data.get("ok"):
             return data
-
         last_err = data
-
         if data.get("error_code") == 429:
             retry_after = (data.get("parameters") or {}).get("retry_after", 5)
             print(f"⚠️ Telegram rate limit. Retrying after {retry_after}s...")
             time.sleep(int(retry_after) + 1)
             continue
-
         raise RuntimeError(f"Telegram error: {data}")
-
     raise RuntimeError(f"Telegram error after retries: {last_err}")
 
 
 # -------------------- JSON SCHEMA --------------------
-SCHEMA = {
+MCQ_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
+        "question": {"type": "string", "minLength": 1, "maxLength": 320},
+        "options": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {"type": "string", "minLength": 1, "maxLength": 120},
+        },
+        "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
+        "correct_answer": {"type": "string", "minLength": 1, "maxLength": 120},
+        "explanation": {"type": "string", "maxLength": 220},
+        "source_url": {"type": "string", "minLength": 5, "maxLength": 400},
+        "source_title": {"type": "string", "minLength": 3, "maxLength": 200},
+    },
+    "required": [
+        "event_key",
+        "question",
+        "options",
+        "correct_option_id",
+        "correct_answer",
+        "explanation",
+        "source_url",
+        "source_title",
+    ],
+    "additionalProperties": False,
+}
+
+SET_SCHEMA = {
     "type": "object",
     "properties": {
         "date": {"type": "string"},
-        "mcqs": {
-            "type": "array",
-            "minItems": 10,
-            "maxItems": 10,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
-                    "question": {"type": "string", "minLength": 1, "maxLength": 320},
-                    "options": {
-                        "type": "array",
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 120},
-                    },
-                    "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "correct_answer": {"type": "string", "minLength": 1, "maxLength": 120},
-                    "explanation": {"type": "string", "maxLength": 220},
-                    "source_url": {"type": "string", "minLength": 5, "maxLength": 400},
-                    "source_title": {"type": "string", "minLength": 3, "maxLength": 200},
-                },
-                "required": [
-                    "event_key",
-                    "question",
-                    "options",
-                    "correct_option_id",
-                    "correct_answer",
-                    "explanation",
-                    "source_url",
-                    "source_title",
-                ],
-                "additionalProperties": False,
-            },
-        },
+        "mcqs": {"type": "array", "minItems": 10, "maxItems": 10, "items": MCQ_ITEM_SCHEMA},
     },
     "required": ["date", "mcqs"],
     "additionalProperties": False,
@@ -118,16 +105,6 @@ SCHEMA = {
 
 # -------------------- HISTORY (NO-REPEAT ACROSS DAYS) --------------------
 def load_history() -> dict:
-    """
-    {
-      "dates": {
-        "YYYY-MM-DD": {"event_keys":[...], "question_norms":[...], "url_hashes":[...]}
-      },
-      "event_keys":[...],
-      "question_norms":[...],
-      "url_hashes":[...]
-    }
-    """
     if not os.path.exists(HISTORY_FILE):
         return {"dates": {}, "event_keys": [], "question_norms": [], "url_hashes": []}
     try:
@@ -141,11 +118,9 @@ def load_history() -> dict:
     except Exception:
         return {"dates": {}, "event_keys": [], "question_norms": [], "url_hashes": []}
 
-
 def save_history(hist: dict) -> None:
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(hist, f, ensure_ascii=False, indent=2)
-
 
 def _norm_text(s: str) -> str:
     s = (s or "").lower().strip()
@@ -153,10 +128,8 @@ def _norm_text(s: str) -> str:
     s = re.sub(r"[^a-z0-9 ]+", "", s)
     return s.strip()
 
-
 def _url_hash(url: str) -> str:
     return hashlib.sha256((url or "").strip().encode("utf-8")).hexdigest()[:24]
-
 
 def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
     today = mcq_set["date"]
@@ -183,9 +156,9 @@ def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
         qns.extend(hist["dates"][d].get("question_norms", []))
         uhs.extend(hist["dates"][d].get("url_hashes", []))
 
-    hist["event_keys"] = eks[-500:]
-    hist["question_norms"] = qns[-500:]
-    hist["url_hashes"] = uhs[-800:]
+    hist["event_keys"] = eks[-600:]
+    hist["question_norms"] = qns[-600:]
+    hist["url_hashes"] = uhs[-1000:]
     return hist
 
 
@@ -194,7 +167,6 @@ def http_get(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.text
-
 
 def strip_html(html: str) -> str:
     text = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
@@ -207,7 +179,6 @@ def strip_html(html: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-
 def extract_title(html: str) -> Optional[str]:
     m = re.search(r"(?is)<title>\s*(.*?)\s*</title>", html)
     if not m:
@@ -216,101 +187,56 @@ def extract_title(html: str) -> Optional[str]:
     t = re.sub(r"\s*\|\s*.*$", "", t).strip()
     return t[:180] if t else None
 
-
 def normalize_date_to_yyyy_mm_dd(raw: str) -> Optional[str]:
     raw = (raw or "").strip()
     if not raw:
         return None
-
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
     m = re.match(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", raw)
     if m:
         d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= mo <= 12 and 1 <= d <= 31:
             return f"{y:04d}-{mo:02d}-{d:02d}"
-
     return None
-
 
 def extract_meta_date(html: str) -> Optional[str]:
     candidates = []
-
     m = re.search(r'property=["\']article:published_time["\']\s+content=["\']([^"\']+)["\']', html, re.I)
     if m:
         candidates.append(m.group(1))
-
     for name in ["publish-date", "date", "parsely-pub-date", "pubdate", "DC.date.issued"]:
         m = re.search(rf'name=["\']{re.escape(name)}["\']\s+content=["\']([^"\']+)["\']', html, re.I)
         if m:
             candidates.append(m.group(1))
-
     m = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)
     if m:
         candidates.append(m.group(1))
-
     for c in candidates:
         iso = normalize_date_to_yyyy_mm_dd(c)
         if iso:
             return iso
-
-    m = re.search(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})",
-        html,
-        re.I,
-    )
-    if m:
-        month = m.group(1).lower()
-        day = int(m.group(2))
-        year = int(m.group(3))
-        month_num = {
-            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-        }[month]
-        return f"{year:04d}-{month_num:02d}-{day:02d}"
-
     return None
-
 
 def guess_date_from_url(url: str) -> Optional[str]:
     u = (url or "").lower()
-
     m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", u)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
-    m = re.search(
-        r"/(\d{1,2})-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{4})/?",
-        u,
-    )
-    if m:
-        day = int(m.group(1))
-        mon = m.group(2)
-        year = int(m.group(3))
-        mon_num = {
-            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-        }[mon]
-        return f"{year:04d}-{mon_num:02d}-{day:02d}"
-
     return None
 
-
-def fetch_article_snippet(url: str, max_chars: int = 900) -> str:
+def fetch_article_snippet(url: str, max_chars: int = 1000) -> str:
     html = http_get(url)
-    text = strip_html(html)
-    return text[:max_chars]
+    return strip_html(html)[:max_chars]
 
 
-# -------------------- SOURCES (YOUR ALLOWED LIST) --------------------
+# -------------------- SOURCES (ALLOWED) --------------------
 def collect_affairscloud(date_iso: str) -> List[Dict[str, str]]:
     base = "https://affairscloud.com/current-affairs-ca/current-affairs-today/"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://affairscloud\.com/current-affairs-[^"\']+)["\']', html, re.I)
-    links = list(dict.fromkeys(links))[:50]
+    links = list(dict.fromkeys(links))[:70]
 
     items = []
     for url in links:
@@ -322,17 +248,14 @@ def collect_affairscloud(date_iso: str) -> List[Dict[str, str]]:
                 items.append({"source": "AffairsCloud", "url": url, "title": title, "date": pub})
         except Exception:
             continue
-
     return items
-
 
 def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.gktoday.in/current-affairs/"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
     links = [u for u in links if "wp-content" not in u]
-    links = list(dict.fromkeys(links))[:80]
+    links = list(dict.fromkeys(links))[:120]
 
     items = []
     for url in links:
@@ -346,17 +269,14 @@ def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
                 items.append({"source": "GKToday", "url": url, "title": title, "date": pub})
         except Exception:
             continue
-
     return items
-
 
 def collect_adda247(date_iso: str) -> List[Dict[str, str]]:
     base = "https://currentaffairs.adda247.com/"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://currentaffairs\.adda247\.com/[^"\']+/)["\']', html, re.I)
     links = [u for u in links if "category" not in u and "tag" not in u and "/page/" not in u]
-    links = list(dict.fromkeys(links))[:120]
+    links = list(dict.fromkeys(links))[:160]
 
     items = []
     for url in links:
@@ -370,17 +290,14 @@ def collect_adda247(date_iso: str) -> List[Dict[str, str]]:
                 items.append({"source": "Adda247", "url": url, "title": title, "date": pub})
         except Exception:
             continue
-
     return items
-
 
 def collect_jagranjosh(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.jagranjosh.com/current-affairs"
     html = http_get(base)
-
     links = re.findall(r'href=["\'](https://www\.jagranjosh\.com/[^"\']+)["\']', html, re.I)
     links = [u for u in links if "/general-knowledge/" in u or "/current-affairs/" in u]
-    links = list(dict.fromkeys(links))[:120]
+    links = list(dict.fromkeys(links))[:160]
 
     items = []
     for url in links:
@@ -394,14 +311,11 @@ def collect_jagranjosh(date_iso: str) -> List[Dict[str, str]]:
                 items.append({"source": "JagranJosh", "url": url, "title": title, "date": pub})
         except Exception:
             continue
-
     return items
-
 
 def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
     today = ist_today_str()
     yesterday = ist_yesterday_str()
-
     sources = [collect_affairscloud, collect_gktoday, collect_adda247, collect_jagranjosh]
 
     all_today = []
@@ -413,7 +327,7 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
         except Exception as e:
             print(f"⚠️ {fn.__name__} failed: {e}")
 
-    # Deduplicate by URL
+    # Dedup by URL
     seen = set()
     dedup = []
     for it in all_today:
@@ -422,15 +336,14 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
             seen.add(h)
             dedup.append(it)
 
-    # If not enough today, add yesterday (still recent, avoids 2025 old junk)
-    if len(dedup) < 14:
+    # Fallback yesterday (only if not enough)
+    if len(dedup) < 18:
         all_yday = []
         for fn in sources:
             try:
                 all_yday.extend(fn(yesterday))
             except Exception:
                 continue
-
         for it in all_yday:
             h = _url_hash(it["url"])
             if h not in seen:
@@ -442,134 +355,180 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
     return today, dedup
 
 
-# -------------------- BAN BANKING/FINANCE (ALLOW ECONOMY) --------------------
-# Banking/Finance terms to exclude (including payments/rates/markets)
+# -------------------- BAN BANKING/FINANCE (ALLOW ECONOMY MACRO) --------------------
 BANK_FIN_BLOCK = [
     "rbi", "repo", "reverse repo", "crr", "slr", "mclr", "mpc",
     "sebi", "irdai", "pfrda", "nbfc",
-    "bank ", "banks", "banking", "loan", "credit", "debit",
-    "upi", "rtgs", "neft", "imps", "payments", "payment",
+    "bank", "banking", "loan", "credit", "debit",
+    "upi", "rtgs", "neft", "imps", "payment",
     "mutual fund", "ipo", "share market", "stock", "stocks", "bond", "g-sec", "treasury bill", "forex",
+    "microfinance", "fintech", "insurance premium",
 ]
 
-# Economy allowed themes (macro/policy) – these are OK even if “economy”
 ECON_ALLOW = [
     "gdp", "inflation", "cpi", "wpi", "fiscal", "budget", "tax", "gst",
     "subsidy", "trade", "export", "import", "current account", "cad",
-    "poverty", "employment", "unemployment", "agriculture", "msp", "food security",
+    "poverty", "employment", "unemployment", "agriculture", "msp",
 ]
 
 def is_banking_finance_related(title: str, snippet: str) -> bool:
     txt = f"{title} {snippet}".lower()
     hit_bank = any(k in txt for k in BANK_FIN_BLOCK)
     hit_econ = any(k in txt for k in ECON_ALLOW)
-    # If it looks banking/finance and NOT clearly macro economy, exclude
     return hit_bank and not hit_econ
 
 
-# -------------------- GENERATION: GK/EXAM-STYLE DIRECT MCQs --------------------
-def _schema_for_n(n: int) -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "date": {"type": "string"},
-            "mcqs": {
-                "type": "array",
-                "minItems": n,
-                "maxItems": n,
-                "items": SCHEMA["properties"]["mcqs"]["items"],
-            },
-        },
-        "required": ["date", "mcqs"],
-        "additionalProperties": False,
-    }
+# -------------------- QUALITY GUARDS (STRICT) --------------------
+VAGUE_PHRASES = [
+    "recently concluded", "significant conference", "took place recently",
+    "focusing on", "important conference", "major conference", "recent defence conference",
+]
+
+STATIC_GK_TRIGGERS = [
+    "what does january", "commemorate", "republic day", "independence day",
+    "labour day", "national youth day", "when is republic day",
+]
+
+BAD_OPTIONS = ["all of the above", "none of the above", "all above", "none"]
+
+def extract_title_entities(title: str) -> List[str]:
+    """
+    Extract entities from title to force anchoring.
+    Examples: 'Integrated Security Hub', 'Kalai-II', 'SOAR', 'CQB', 'PM Modi'
+    """
+    t = title or ""
+    entities = set()
+
+    # Acronyms / All-caps words length>=2
+    for m in re.findall(r"\b[A-Z]{2,}\b", t):
+        entities.add(m)
+
+    # Hyphenated / with digits like Kalai-II, 72nd, etc.
+    for m in re.findall(r"\b[A-Za-z]+[-–][A-Za-z0-9]+\b", t):
+        entities.add(m)
+
+    # Title-case sequences (2-4 words) like Integrated Security Hub
+    for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", t):
+        entities.add(m)
+
+    # Single capitalized proper nouns (fallback)
+    for m in re.findall(r"\b[A-Z][a-z]{3,}\b", t):
+        entities.add(m)
+
+    # remove very generic
+    stop = {"India", "Indian", "January", "February", "March", "April", "May", "June", "July",
+            "August", "September", "October", "November", "December", "Monday", "Tuesday",
+            "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Government", "Ministry"}
+    entities = [e for e in entities if e not in stop and len(e) >= 4]
+    # prefer longer entities first
+    entities.sort(key=len, reverse=True)
+    return entities[:8]
+
+def contains_any_entity(text: str, entities: List[str]) -> bool:
+    txt = (text or "").lower()
+    for e in entities:
+        if e.lower() in txt:
+            return True
+    return False
+
+def is_exam_style_direct(qtext: str) -> bool:
+    t = (qtext or "").strip().lower()
+    # Reject UPSC-style statements
+    if t.startswith(("with reference to", "consider the following statements", "which of the statements")):
+        return False
+    # Must be direct question (like daily quiz)
+    if not t.endswith("?"):
+        return False
+    if not t.startswith(("which", "what", "who", "where", "when", "name", "the name")):
+        # allow some direct forms if they still look like MCQ prompt
+        return False
+    return True
+
+def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
+    q = (mcq.get("question") or "")
+    opts = mcq.get("options") or []
+    exp = mcq.get("explanation") or ""
+
+    # Must be anchored: include at least one entity from title in question
+    if not contains_any_entity(q, title_entities):
+        return False
+
+    # No vague phrasing
+    low = q.lower()
+    if any(v in low for v in VAGUE_PHRASES):
+        return False
+
+    # No static GK triggers
+    if any(s in low for s in STATIC_GK_TRIGGERS):
+        return False
+
+    # No all/none options
+    if any((_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS]) for o in opts):
+        return False
+
+    # Direct exam style
+    if not is_exam_style_direct(q):
+        return False
+
+    # Banking/finance ban (question/options/explanation)
+    joined = (q + " " + " ".join(opts) + " " + exp).lower()
+    if any(k in joined for k in BANK_FIN_BLOCK):
+        # allow macro economy ONLY if economy keywords exist AND banking terms are not the core
+        if not any(k in joined for k in ECON_ALLOW):
+            return False
+        # still reject if it's clearly RBI/SEBI/UPI etc.
+        if any(k in joined for k in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
+            return False
+
+    # Options distinct
+    if len(opts) != 4:
+        return False
+    if len(set(_norm_text(o) for o in opts)) != 4:
+        return False
+
+    # correct_answer mapping
+    ca = mcq.get("correct_answer", "")
+    if ca not in opts:
+        return False
+    if opts.index(ca) != mcq.get("correct_option_id", -1):
+        # auto-fix later; still acceptable
+        pass
+
+    return True
 
 
-def generate_mcqs() -> dict:
-    today_label, items = collect_fresh_items()
-    if len(items) < 10:
-        raise RuntimeError(f"Not enough fresh items from CA sources. Found {len(items)}.")
+# -------------------- MCQ GENERATION (ONE ARTICLE -> ONE MCQ) --------------------
+def generate_one_mcq_from_article(article: Dict[str, str], avoid_event_keys: List[str], avoid_qnorms: List[str]) -> Optional[Dict[str, Any]]:
+    title = article["title"]
+    url = article["url"]
+    snippet = article["snippet"]
+    entities = extract_title_entities(title)
 
-    hist = load_history()
-    used_url_hashes = set(hist.get("url_hashes", [])[-800:])
-    used_event_keys = set(_norm_text(x) for x in (hist.get("event_keys", [])[-500:]))
-    used_qnorms = set(hist.get("question_norms", [])[-500:])
-
-    # Build evidence pack (filter repeats + banking/finance)
-    pack = []
-    seen_title = set()
-
-    # Try more candidates because some will be filtered out
-    for it in items[:80]:
-        uh = _url_hash(it["url"])
-        if uh in used_url_hashes:
-            continue
-
-        tn = _norm_text(it["title"])
-        if tn in seen_title:
-            continue
-        seen_title.add(tn)
-
-        try:
-            snippet = fetch_article_snippet(it["url"], max_chars=900)
-        except Exception:
-            snippet = ""
-
-        # Exclude banking/finance (economy allowed)
-        if is_banking_finance_related(it["title"], snippet):
-            continue
-
-        pack.append(
-            {
-                "source": it["source"],
-                "date": it["date"],
-                "title": it["title"],
-                "url": it["url"],
-                "snippet": snippet,
-            }
-        )
-
-        if len(pack) >= 28:
-            break
-
-    if len(pack) < 14:
-        raise RuntimeError(
-            f"Not enough usable items after filters (banking/finance removed). Found {len(pack)}."
-        )
-
-    # System prompt tuned to match YOUR SAMPLE (direct factual daily quiz)
+    # Model must use evidence only + must include entity
     system = (
         "You are a daily Current Affairs MCQ setter for SSC/State PCS/Railways/General Govt exams.\n"
-        "You must write questions in the SAME style as popular daily quiz formats:\n"
-        "- Direct factual questions (Who/What/Which/Where/When).\n"
-        "- NOT statement-based UPSC format.\n"
-        "- One event = one question.\n"
-        "\n"
-        "STRICT RULES:\n"
-        "1) Use ONLY the provided evidence pack (title/url/snippet). Do NOT add outside facts.\n"
-        "2) Freshness: Prefer items dated today; if yesterday items exist, use only if needed.\n"
-        "3) HARD BAN: Do NOT create Banking/Finance questions (RBI/SEBI/IRDAI/PFRDA, repo/CRR/SLR/MCLR,\n"
-        "   UPI/RTGS/NEFT, banks/NBFCs, stock market/IPO/mutual funds).\n"
-        "   Economy is allowed ONLY at macro/policy level (GDP, inflation, budget, GST, trade, poverty, employment, agriculture).\n"
-        "4) Questions must look like real exam MCQs: concise, clear, no casual tone.\n"
-        "5) Options must be plausible and same-category (states vs states, ministries vs ministries, organisations vs organisations).\n"
-        "6) correct_answer must EXACTLY match one option; correct_option_id must match index.\n"
-        "7) explanation <= 220 chars, short and exam-friendly.\n"
-        "8) Ensure 10 questions are from 10 different topics (no duplicates).\n"
+        "Write ONE direct factual MCQ (daily-quiz style) from the given article evidence.\n"
+        "STRICT:\n"
+        "- Use ONLY the provided title+snippet. Do NOT add outside facts.\n"
+        "- The question MUST include at least one key entity from the title (proper noun/term).\n"
+        "- Question must start with: Which/What/Who/Where/When/Name and end with '?'.\n"
+        "- Do NOT use: 'With reference to', 'Consider the following statements'.\n"
+        "- Do NOT use 'All of the above' or 'None of the above'.\n"
+        "- Do NOT create Banking/Finance CA (RBI/SEBI/UPI/repo/banks/markets). Economy macro allowed.\n"
+        "- Options must be plausible and same-category.\n"
+        "- correct_answer must exactly match one option; correct_option_id must match it.\n"
+        "- Explanation <= 220 chars.\n"
+        "- event_key must be a short unique identifier (3–10 words).\n"
     )
 
     user = {
-        "posting_date_label": today_label,
-        "evidence_pack": pack,
-        "avoid": {
-            "used_event_keys": sorted(list(used_event_keys))[:200],
-            "used_question_norms": sorted(list(used_qnorms))[:200],
-        },
-        "output_rules": "Return JSON strictly as per schema.",
-        "note": "Do not force fixed section-wise quotas; pick most exam-relevant items available."
+        "source_title": title,
+        "source_url": url,
+        "snippet": snippet,
+        "must_include_one_of_entities": entities[:6],
+        "avoid_event_keys_norm": avoid_event_keys[:200],
+        "avoid_question_norms": avoid_qnorms[:200],
     }
-
-    schema = _schema_for_n(10)
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
@@ -580,112 +539,131 @@ def generate_mcqs() -> dict:
         text={
             "format": {
                 "type": "json_schema",
-                "name": "daily_exam_style_ca_mcqs",
+                "name": "single_mcq",
                 "strict": True,
-                "schema": schema,
+                "schema": MCQ_ITEM_SCHEMA,
             }
         },
     )
 
-    mcq_set = json.loads(resp.output_text)
-    mcq_set["date"] = today_label
-    return mcq_set
+    mcq = json.loads(resp.output_text)
+
+    # Force source fields to match
+    mcq["source_title"] = title[:200]
+    mcq["source_url"] = url[:400]
+
+    # Fix answer mapping if needed
+    opts = mcq.get("options") or []
+    ca = mcq.get("correct_answer", "")
+    if ca in opts:
+        mcq["correct_option_id"] = opts.index(ca)
+
+    # Hard filter check
+    if not passes_hard_filters(mcq, entities):
+        return None
+
+    return mcq
 
 
-# -------------------- QUALITY GUARDS (MATCH YOUR SAMPLE STYLE) --------------------
-def is_exam_style_question(q: Dict[str, Any]) -> bool:
-    txt = (q.get("question") or "").strip().lower()
-    # Must be direct style; reject statement-based UPSC format
-    bad_starts = ("consider the following statements", "with reference to", "which of the statements")
-    if txt.startswith(bad_starts):
-        return False
+def generate_mcq_set() -> Dict[str, Any]:
+    today_label, items = collect_fresh_items()
+    if len(items) < 10:
+        raise RuntimeError(f"Not enough fresh items from CA sources. Found {len(items)}.")
 
-    good_starts = (
-        "which", "what", "who", "where", "when", "name the", "the name of", "recently",
-        "skilling",  # allows a few titles converted into direct
-    )
-    if not txt.startswith(good_starts):
-        # still allow if it ends with '?', and short
-        if not txt.endswith("?"):
-            return False
+    hist = load_history()
+    used_url_hashes = set(hist.get("url_hashes", [])[-1000:])
+    used_event_keys = [_norm_text(x) for x in (hist.get("event_keys", [])[-600:])]
+    used_qnorms = hist.get("question_norms", [])[-600:]
 
-    if len(txt) > 320:
-        return False
-    return True
-
-
-def enforce_no_banking_finance(q: Dict[str, Any]) -> bool:
-    text = (q.get("question", "") + " " + " ".join(q.get("options", [])) + " " + q.get("explanation","")).lower()
-    # if any blocked term appears, reject (even if model slips)
-    return not any(k in text for k in BANK_FIN_BLOCK)
-
-
-def normalize_and_dedupe_mcqs(mcq_set: dict) -> dict:
-    seen_q = set()
-    seen_ek = set()
-    seen_url = set()
-
-    out = []
-    for q in mcq_set.get("mcqs", []):
-        # basic checks
-        if not is_exam_style_question(q):
-            continue
-        if not enforce_no_banking_finance(q):
+    # Build article pool with snippets + filters
+    pool = []
+    seen_title = set()
+    for it in items[:120]:
+        uh = _url_hash(it["url"])
+        if uh in used_url_hashes:
             continue
 
-        # mapping checks
-        opts = q.get("options") or []
-        if len(opts) != 4:
+        tn = _norm_text(it["title"])
+        if tn in seen_title:
             continue
-        if len(set(_norm_text(o) for o in opts)) != 4:
+        seen_title.add(tn)
+
+        try:
+            snippet = fetch_article_snippet(it["url"], max_chars=1100)
+        except Exception:
+            snippet = ""
+
+        # filter banking/finance at article level
+        if is_banking_finance_related(it["title"], snippet):
             continue
 
-        ca = q.get("correct_answer", "")
-        if ca not in opts:
-            continue
-        q["correct_option_id"] = opts.index(ca)
+        pool.append({**it, "snippet": snippet})
 
-        qn = _norm_text(q.get("question", ""))
-        ek = _norm_text(q.get("event_key", ""))
-        uh = _url_hash(q.get("source_url", ""))
+    if len(pool) < 14:
+        raise RuntimeError(f"Not enough usable articles after banking/finance filter. Found {len(pool)}.")
 
-        if not ek or ek in seen_ek:
-            continue
-        if not qn or qn in seen_q:
-            continue
-        if uh in seen_url:
+    # Create 10 MCQs by iterating articles and regenerating when needed
+    out: List[Dict[str, Any]] = []
+    seen_event = set(_norm_text(x) for x in used_event_keys)
+    seen_q = set(_norm_text(x) for x in used_qnorms)
+    seen_url = set(used_url_hashes)
+
+    max_attempts = 60
+    attempts = 0
+
+    # shuffle pool so you don't always pick same order
+    rnd = random.Random(today_label)
+    rnd.shuffle(pool)
+
+    i = 0
+    while len(out) < 10 and attempts < max_attempts and i < len(pool):
+        art = pool[i]
+        i += 1
+        attempts += 1
+
+        # Skip if URL already used (extra safety)
+        if _url_hash(art["url"]) in seen_url:
             continue
 
+        mcq = generate_one_mcq_from_article(
+            art,
+            avoid_event_keys=list(seen_event),
+            avoid_qnorms=list(seen_q),
+        )
+        if not mcq:
+            continue
+
+        ek = _norm_text(mcq["event_key"])
+        qn = _norm_text(mcq["question"])
+        uh = _url_hash(mcq["source_url"])
+
+        if ek in seen_event or qn in seen_q or uh in seen_url:
+            continue
+
+        # accept
+        seen_event.add(ek)
         seen_q.add(qn)
-        seen_ek.add(ek)
         seen_url.add(uh)
+        out.append(mcq)
 
-        # trim
-        q["explanation"] = (q.get("explanation") or "")[:220]
-        q["source_title"] = (q.get("source_title") or "")[:200]
-        q["source_url"] = (q.get("source_url") or "")[:400]
+    if len(out) < 10:
+        raise RuntimeError(f"Could not build 10 high-quality anchored MCQs. Got {len(out)}.")
 
-        out.append(q)
-
-    mcq_set["mcqs"] = out[:10]
-    return mcq_set
+    return {"date": today_label, "mcqs": out}
 
 
 # -------------------- QUIZ POSTING --------------------
 def shuffle_options_and_fix_answer(q: dict) -> dict:
     options = q["options"]
     correct_text = options[q["correct_option_id"]]
-
     seed = q["question"] + correct_text
     rnd = random.Random(seed)
     shuffled = options[:]
     rnd.shuffle(shuffled)
-
     q["options"] = shuffled
     q["correct_option_id"] = shuffled.index(correct_text)
     q["correct_answer"] = correct_text
     return q
-
 
 def post_competitive_closure_message():
     text = (
@@ -694,48 +672,22 @@ def post_competitive_closure_message():
         "Let’s see how many 8+ scorers we have today 🔥\n\n"
         "⏰ Back tomorrow at the same time."
     )
-    tg(
-        "sendMessage",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": True,
-        },
-    )
-
+    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True})
 
 def post_score_poll(date_str: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "question": f"📊 Vote your score ({date_str}) ✅\nHow many were correct out of 10?",
-        "options": [
-            "10/10 🏆",
-            "9/10 🔥",
-            "8/10 ✅",
-            "7/10 👍",
-            "6/10 🙂",
-            "5/10 📘",
-            "4/10 🧠",
-            "3 or less 😅",
-        ],
+        "options": ["10/10 🏆", "9/10 🔥", "8/10 ✅", "7/10 👍", "6/10 🙂", "5/10 📘", "4/10 🧠", "3 or less 😅"],
         "is_anonymous": True,
         "allows_multiple_answers": False,
     }
     tg("sendPoll", payload)
 
-
 def post_to_channel(mcq_set: dict):
-    tg(
-        "sendMessage",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇",
-        },
-    )
-
+    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🧠 Daily Current Affairs Quiz ({mcq_set['date']})\n\n10 MCQ polls below 👇"})
     for i, q in enumerate(mcq_set["mcqs"], start=1):
         q = shuffle_options_and_fix_answer(q)
-
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": f"Q{i}. {q['question']}",
@@ -749,14 +701,12 @@ def post_to_channel(mcq_set: dict):
         time.sleep(SLEEP_BETWEEN_POLLS)
 
     time.sleep(SLEEP_AFTER_QUIZ)
-
     try:
         post_competitive_closure_message()
     except Exception as e:
         print("❌ Failed to post closure message:", e)
 
     time.sleep(2)
-
     try:
         post_score_poll(mcq_set["date"])
     except Exception as e:
@@ -765,22 +715,7 @@ def post_to_channel(mcq_set: dict):
 
 # -------------------- MAIN --------------------
 def main():
-    mcq_set = generate_mcqs()
-    mcq_set = normalize_and_dedupe_mcqs(mcq_set)
-
-    # If less than 10 after guards, regenerate once and merge
-    if len(mcq_set["mcqs"]) < 10:
-        print(f"⚠️ Only {len(mcq_set['mcqs'])} MCQs after quality guards. Regenerating once...")
-        mcq_set2 = generate_mcqs()
-        mcq_set2 = normalize_and_dedupe_mcqs(mcq_set2)
-
-        merged = {"date": mcq_set["date"], "mcqs": mcq_set["mcqs"] + mcq_set2["mcqs"]}
-        merged = normalize_and_dedupe_mcqs(merged)
-        mcq_set["mcqs"] = merged["mcqs"][:10]
-
-    if len(mcq_set["mcqs"]) < 10:
-        raise RuntimeError(f"Could not reach 10 good exam-style MCQs. Got {len(mcq_set['mcqs'])}.")
-
+    mcq_set = generate_mcq_set()
     post_to_channel(mcq_set)
 
     hist = load_history()
@@ -788,7 +723,6 @@ def main():
     save_history(hist)
 
     print("✅ Posted 10 quiz polls + message + score poll successfully.")
-
 
 if __name__ == "__main__":
     main()
