@@ -225,7 +225,6 @@ def fetch_article_snippet(url: str, max_chars: int = 1100) -> str:
 
 
 # -------------------- SOURCE FILTERS (BLOCK META/LISTS) --------------------
-# ✅ UPDATED (stronger) list to avoid "Important Days/Appointments" pages
 BLOCK_TITLE_PHRASES = [
     # Meta / category / list pages
     "important days", "appointments", "current affairs section",
@@ -304,7 +303,7 @@ def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
 
     links = re.findall(r'href=["\'](https://www\.nextias\.com/daily-current-affairs/[^"\']+)["\']', html, re.I)
     links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
-    links = list(dict.fromkeys(links))[:120]
+    links = list(dict.fromkeys(links))[:160]
 
     items = []
     for url in links:
@@ -314,6 +313,7 @@ def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
             if not title:
                 continue
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            # accept today OR unknown (NextIAS often hides clean date)
             if pub == date_iso or pub == "":
                 items.append({"source": "NextIAS", "url": url, "title": title, "date": pub or date_iso})
         except Exception:
@@ -327,7 +327,7 @@ def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
 
     links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
     links = [u for u in links if "wp-content" not in u]
-    links = list(dict.fromkeys(links))[:140]
+    links = list(dict.fromkeys(links))[:180]
 
     items = []
     for url in links:
@@ -337,8 +337,9 @@ def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
             if not title:
                 continue
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub == date_iso:
-                items.append({"source": "GKToday", "url": url, "title": title, "date": pub})
+            # accept today OR unknown (GKToday sometimes not easy)
+            if pub == date_iso or pub == "":
+                items.append({"source": "GKToday", "url": url, "title": title, "date": pub or date_iso})
         except Exception:
             continue
     return items
@@ -348,9 +349,12 @@ def collect_drishtiias(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.drishtiias.com/current-affairs-news-analysis-editorials"
     html = http_get(base)
 
-    links = re.findall(r'href=["\'](https://www\.drishtiias\.com/current-affairs-news-analysis-editorials/[^"\']+)["\']', html, re.I)
+    links = re.findall(
+        r'href=["\'](https://www\.drishtiias\.com/current-affairs-news-analysis-editorials/[^"\']+)["\']',
+        html, re.I
+    )
     links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
-    links = list(dict.fromkeys(links))[:180]
+    links = list(dict.fromkeys(links))[:220]
 
     items = []
     for url in links:
@@ -382,6 +386,7 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
         except Exception as e:
             print(f"⚠️ {fn.__name__} failed: {e}")
 
+    # Dedup by URL
     seen = set()
     dedup = []
     for it in all_today:
@@ -390,6 +395,7 @@ def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
             seen.add(h)
             dedup.append(it)
 
+    # Fallback yesterday if too low
     if len(dedup) < 20:
         all_yday = []
         for fn in sources:
@@ -438,28 +444,36 @@ def extract_title_entities(title: str) -> List[str]:
     }
     entities = [e for e in entities if e not in stop and len(e) >= 4]
     entities.sort(key=len, reverse=True)
-    return entities[:8]
+    return entities[:10]
 
-def contains_any_entity(text: str, entities: List[str]) -> bool:
-    txt = (text or "").lower()
-    for e in entities:
-        if e.lower() in txt:
-            return True
-    return False
+def contains_any_entity_anywhere(mcq: Dict[str, Any], entities: List[str]) -> bool:
+    if not entities:
+        # If we couldn't extract entities, do not kill the MCQ (avoid "Got 0" situation)
+        return True
+    joined = (mcq.get("question") or "") + " " + " ".join(mcq.get("options") or []) + " " + (mcq.get("explanation") or "")
+    low = joined.lower()
+    return any(e.lower() in low for e in entities)
 
-def is_exam_style_direct(qtext: str) -> bool:
+def is_exam_style(qtext: str) -> bool:
+    """
+    Accept BOTH:
+    - Direct objective style (SSC/PCS)
+    - UPSC statement style (your "UPSC level" ask)
+    """
     t = (qtext or "").strip().lower()
-    if t.startswith(("with reference to", "consider the following statements", "which of the statements")):
+    if not t:
         return False
-    if not t.endswith("?"):
-        return False
-    if not t.startswith(("which", "what", "who", "where", "when", "name", "the name")):
-        return False
-    return True
+    # must end with ? OR contain statement pattern
+    if t.endswith("?"):
+        return True
+    if t.startswith("with reference to") or t.startswith("consider the following statements"):
+        return True
+    return False
 
 def enforce_no_banking_finance_text(text: str) -> bool:
     low = (text or "").lower()
     if any(k in low for k in BANK_FIN_BLOCK):
+        # allow macro economy keywords, but still block RBI/SEBI/UPI etc.
         if any(k in low for k in ECON_ALLOW) and not any(x in low for x in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
             return True
         return False
@@ -470,10 +484,9 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     opts = mcq.get("options") or []
     exp = mcq.get("explanation") or ""
     title = (mcq.get("source_title") or "").lower()
-
     qlow = q.lower()
 
-    # ✅ HARD BAN: meta/website-structure questions (Important Days/Appointments section type)
+    # HARD BAN: meta/website-structure questions (Important Days/Appointments section type)
     META_Q_PATTERNS = [
         "important days", "appointments current affairs", "current affairs section",
         "section cover", "section covers", "what kind of events does",
@@ -481,23 +494,15 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     ]
     if any(p in qlow for p in META_Q_PATTERNS):
         return False
-
-    # ✅ Reject if question is about "section/category" instead of real event
     if "section" in qlow or "category" in qlow:
         return False
 
-    # must be anchored to title entities => prevents generic/hallucinated questions
-    if not contains_any_entity(q, title_entities):
-        return False
-
-    # no meta/list pages
+    # no meta/list pages by title
     if any(p in title for p in BLOCK_TITLE_PHRASES):
         return False
 
     # no vague/meta questions
     if any(v in qlow for v in VAGUE_PHRASES):
-        return False
-    if "section" in qlow and ("cover" in qlow or "focus" in qlow):
         return False
 
     # no static GK patterns
@@ -508,8 +513,8 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     if any(_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS] for o in opts):
         return False
 
-    # direct exam style
-    if not is_exam_style_direct(q):
+    # exam style: allow direct or UPSC statement style
+    if not is_exam_style(q):
         return False
 
     # banking/finance ban
@@ -527,40 +532,47 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     if ca not in opts:
         return False
 
+    # entity anchoring (relaxed + checks in question+options+explanation)
+    if not contains_any_entity_anywhere(mcq, title_entities):
+        return False
+
     return True
 
 
 # -------------------- MCQ GENERATION (ONE ARTICLE -> ONE MCQ) --------------------
-def generate_one_mcq_from_article(article: Dict[str, Any], avoid_event_keys: List[str], avoid_qnorms: List[str]) -> Optional[Dict[str, Any]]:
+def generate_one_mcq_from_article(
+    article: Dict[str, Any],
+    avoid_event_keys: List[str],
+    avoid_qnorms: List[str]
+) -> Optional[Dict[str, Any]]:
     title = article["title"]
     url = article["url"]
     snippet = article["snippet"]
     entities = extract_title_entities(title)
 
     system = (
-        "You are a daily Current Affairs MCQ setter for SSC/State PCS/Railways/General Govt exams.\n"
-        "Write ONE direct factual MCQ from the given article evidence.\n"
+        "You are a high-quality Current Affairs MCQ setter for UPSC/State PCS/SSC-level exams.\n"
+        "Write ONE exam-standard MCQ from the provided evidence.\n"
         "STRICT:\n"
         "- Use ONLY the provided title+snippet. Do NOT add outside facts.\n"
-        "- Question MUST include at least one key entity from the title.\n"
-        "- Start with Which/What/Who/Where/When/Name and end with '?'.\n"
-        "- Do NOT use: 'With reference to' or 'Consider the following statements'.\n"
+        "- The question must be anchored to the article (use a key term/name/organisation/place).\n"
+        "- You MAY use UPSC-style statement framing (With reference to / Consider the following statements).\n"
+        "- Do NOT make meta questions about sections/categories (Important Days/Appointments etc.).\n"
         "- Do NOT use 'All of the above'/'None of the above'.\n"
-        "- Do NOT create Banking/Finance CA (RBI/SEBI/UPI/repo/banks/markets). Economy macro allowed.\n"
-        "- Do NOT create meta questions about sections/categories (Important Days/Appointments etc.).\n"
+        "- Do NOT create Banking/Finance CA (RBI/SEBI/UPI/repo/banks/markets). Macro economy allowed.\n"
         "- Options must be plausible and same-category.\n"
         "- correct_answer must exactly match one option; correct_option_id must match.\n"
         "- Explanation <= 220 chars.\n"
-        "- event_key must be a short unique identifier (3–10 words).\n"
+        "- event_key must be a short unique identifier (3–10 words) for this event.\n"
     )
 
     user = {
         "source_title": title,
         "source_url": url,
         "snippet": snippet,
-        "must_include_one_of_entities": entities[:6],
-        "avoid_event_keys_norm": avoid_event_keys[:200],
-        "avoid_question_norms": avoid_qnorms[:200],
+        "anchor_entities_hint": entities[:8],
+        "avoid_event_keys_norm": avoid_event_keys[:250],
+        "avoid_question_norms": avoid_qnorms[:250],
     }
 
     resp = client.responses.create(
@@ -607,7 +619,7 @@ def generate_mcq_set() -> Dict[str, Any]:
     pool = []
     seen_title = set()
 
-    for it in items[:160]:
+    for it in items[:200]:
         uh = _url_hash(it["url"])
         if uh in used_url_hashes:
             continue
@@ -622,7 +634,7 @@ def generate_mcq_set() -> Dict[str, Any]:
             continue
 
         try:
-            snippet = fetch_article_snippet(it["url"], max_chars=1200)
+            snippet = fetch_article_snippet(it["url"], max_chars=1400)
         except Exception:
             snippet = ""
 
@@ -635,7 +647,7 @@ def generate_mcq_set() -> Dict[str, Any]:
             "is_international": is_international_item(it["title"], snippet),
         })
 
-    if len(pool) < 16:
+    if len(pool) < 12:
         raise RuntimeError(f"Not enough usable articles after filters. Found {len(pool)}.")
 
     rnd = random.Random(today_label)
@@ -645,84 +657,62 @@ def generate_mcq_set() -> Dict[str, Any]:
     seen_event = set(_norm_text(x) for x in used_event_keys)
     seen_q = set(_norm_text(x) for x in used_qnorms)
     seen_url = set(used_url_hashes)
-    seen_topic_entities = set()
 
     intl_count = 0
     MIN_INTL = 2
 
-    max_attempts = 100
+    max_attempts = 160
     attempts = 0
 
-    i = 0
-    while len(out) < 10 and attempts < max_attempts and i < len(pool):
-        art = pool[i]
-        i += 1
+    # First, ensure international minimum
+    for art in pool:
+        if len(out) >= 10:
+            break
+        if intl_count >= MIN_INTL:
+            break
         attempts += 1
-
-        if intl_count < MIN_INTL and not art.get("is_international", False):
+        if attempts > max_attempts:
+            break
+        if not art.get("is_international", False):
             continue
-
-        if _url_hash(art["url"]) in seen_url:
+        uh = _url_hash(art["url"])
+        if uh in seen_url:
             continue
-
-        mcq = generate_one_mcq_from_article(
-            art,
-            avoid_event_keys=list(seen_event),
-            avoid_qnorms=list(seen_q),
-        )
+        mcq = generate_one_mcq_from_article(art, list(seen_event), list(seen_q))
         if not mcq:
             continue
-
         ek = _norm_text(mcq["event_key"])
         qn = _norm_text(mcq["question"])
-        uh = _url_hash(mcq["source_url"])
-
-        if ek in seen_event or qn in seen_q or uh in seen_url:
+        uh2 = _url_hash(mcq["source_url"])
+        if ek in seen_event or qn in seen_q or uh2 in seen_url:
             continue
+        seen_event.add(ek); seen_q.add(qn); seen_url.add(uh2)
+        out.append(mcq)
+        intl_count += 1
 
-        topic_entities = extract_title_entities(mcq["source_title"])
-        topic_key = _norm_text(topic_entities[0]) if topic_entities else ""
-        if topic_key and topic_key in seen_topic_entities:
+    # Then fill remaining with any (national + international mixed, exam-relevant)
+    attempts2 = 0
+    for art in pool:
+        if len(out) >= 10:
+            break
+        attempts2 += 1
+        if attempts2 > max_attempts:
+            break
+        uh = _url_hash(art["url"])
+        if uh in seen_url:
             continue
-
-        seen_event.add(ek)
-        seen_q.add(qn)
-        seen_url.add(uh)
-        if topic_key:
-            seen_topic_entities.add(topic_key)
-
+        mcq = generate_one_mcq_from_article(art, list(seen_event), list(seen_q))
+        if not mcq:
+            continue
+        ek = _norm_text(mcq["event_key"])
+        qn = _norm_text(mcq["question"])
+        uh2 = _url_hash(mcq["source_url"])
+        if ek in seen_event or qn in seen_q or uh2 in seen_url:
+            continue
+        seen_event.add(ek); seen_q.add(qn); seen_url.add(uh2)
         out.append(mcq)
         if art.get("is_international", False):
             intl_count += 1
-
-    if len(out) < 10:
-        for art in pool:
-            if len(out) >= 10:
-                break
-            if _url_hash(art["url"]) in seen_url:
-                continue
-            mcq = generate_one_mcq_from_article(
-                art,
-                avoid_event_keys=list(seen_event),
-                avoid_qnorms=list(seen_q),
-            )
-            if not mcq:
-                continue
-            ek = _norm_text(mcq["event_key"])
-            qn = _norm_text(mcq["question"])
-            uh = _url_hash(mcq["source_url"])
-            if ek in seen_event or qn in seen_q or uh in seen_url:
-                continue
-            topic_entities = extract_title_entities(mcq["source_title"])
-            topic_key = _norm_text(topic_entities[0]) if topic_entities else ""
-            if topic_key and topic_key in seen_topic_entities:
-                continue
-            seen_event.add(ek)
-            seen_q.add(qn)
-            seen_url.add(uh)
-            if topic_key:
-                seen_topic_entities.add(topic_key)
-            out.append(mcq)
 
     if len(out) < 10:
         raise RuntimeError(f"Could not build 10 high-quality anchored MCQs. Got {len(out)}.")
