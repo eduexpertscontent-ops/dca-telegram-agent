@@ -19,16 +19,15 @@ KEEP_LAST_DAYS = int(os.getenv("KEEP_LAST_DAYS", "15"))
 SLEEP_BETWEEN_POLLS = float(os.getenv("SLEEP_BETWEEN_POLLS", "2"))
 SLEEP_AFTER_QUIZ = float(os.getenv("SLEEP_AFTER_QUIZ", "2"))
 
-NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "20"))
-MAX_NEWS_ITEMS = int(os.getenv("MAX_NEWS_ITEMS", "180"))          # raw pool size
-CONTEXT_ITEMS = int(os.getenv("CONTEXT_ITEMS", "70"))             # items sent to model
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "80"))               # top after exam scoring
-MIN_TODAY_ITEMS_REQUIRED = int(os.getenv("MIN_TODAY_ITEMS_REQUIRED", "25"))  # else allow last 24h
+NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "25"))
+MAX_NEWS_ITEMS = int(os.getenv("MAX_NEWS_ITEMS", "250"))
+CONTEXT_ITEMS = int(os.getenv("CONTEXT_ITEMS", "70"))
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "120"))
+MIN_TODAY_ITEMS_REQUIRED = int(os.getenv("MIN_TODAY_ITEMS_REQUIRED", "18"))
 
 HISTORY_FILE = "mcq_history.json"
 
 client = OpenAI()
-
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
@@ -51,7 +50,7 @@ def tg(method: str, payload: dict) -> dict:
     raise RuntimeError(f"Telegram error after retries: {last_err}")
 
 
-# -------------------- JSON SCHEMA --------------------
+# -------------------- SCHEMA (adds mcq_type + difficulty + source_hint, not posted) --------------------
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -64,6 +63,8 @@ SCHEMA = {
                 "type": "object",
                 "properties": {
                     "event_key": {"type": "string", "minLength": 3, "maxLength": 60},
+                    "mcq_type": {"type": "string", "minLength": 3, "maxLength": 30},
+                    "difficulty": {"type": "string", "enum": ["Easy", "Moderate"]},
                     "question": {"type": "string", "minLength": 1, "maxLength": 300},
                     "options": {
                         "type": "array",
@@ -74,14 +75,18 @@ SCHEMA = {
                     "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
                     "correct_answer": {"type": "string", "minLength": 1, "maxLength": 100},
                     "explanation": {"type": "string", "maxLength": 200},
+                    "source_hint": {"type": "string", "maxLength": 120},
                 },
                 "required": [
                     "event_key",
+                    "mcq_type",
+                    "difficulty",
                     "question",
                     "options",
                     "correct_option_id",
                     "correct_answer",
                     "explanation",
+                    "source_hint",
                 ],
                 "additionalProperties": False,
             },
@@ -136,10 +141,10 @@ def update_history_with_set(hist: dict, mcq_set: dict, keep_last_days: int, used
         tns.extend(hist["dates"][d].get("title_norms", []))
         uhs.extend(hist["dates"][d].get("url_hashes", []))
 
-    hist["questions"] = qs[-450:]
-    hist["event_keys"] = eks[-450:]
-    hist["title_norms"] = tns[-700:]
-    hist["url_hashes"] = uhs[-700:]
+    hist["questions"] = qs[-600:]
+    hist["event_keys"] = eks[-600:]
+    hist["title_norms"] = tns[-1000:]
+    hist["url_hashes"] = uhs[-1000:]
     return hist
 
 
@@ -166,28 +171,23 @@ def _dedupe_keep_order_by_key(items, key_fn):
     return out
 
 
-def _schema_for_n(n: int) -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "date": {"type": "string"},
-            "mcqs": {
-                "type": "array",
-                "minItems": n,
-                "maxItems": n,
-                "items": SCHEMA["properties"]["mcqs"]["items"],
-            },
-        },
-        "required": ["date", "mcqs"],
-        "additionalProperties": False,
-    }
-
-
 # -------------------- RSS FETCH --------------------
 def _get(url: str) -> str:
     r = requests.get(url, timeout=NEWS_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
+
+
+def _safe_parse_date(pub: str):
+    if not pub:
+        return None
+    try:
+        d = parsedate_to_datetime(pub)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(IST)
+    except Exception:
+        return None
 
 
 def _parse_rss_items(xml_text: str):
@@ -203,67 +203,37 @@ def _parse_rss_items(xml_text: str):
         pub = (item.findtext("pubDate") or "").strip()
         desc = (item.findtext("description") or "").strip()
 
-        pub_dt = None
-        if pub:
-            try:
-                pub_dt = parsedate_to_datetime(pub)
-                if pub_dt.tzinfo is None:
-                    pub_dt = pub_dt.replace(tzinfo=dt.timezone.utc)
-                pub_dt = pub_dt.astimezone(IST)
-            except Exception:
-                pub_dt = None
+        pub_dt = _safe_parse_date(pub)
 
         items.append(
             {
                 "title": title,
                 "link": link,
                 "published_ist": pub_dt,
-                "description": re.sub(r"<.*?>", "", desc)[:220],
+                "description": re.sub(r"<.*?>", "", desc)[:240],
             }
         )
     return items
 
 
+# -------------------- AUTHENTIC SOURCES ONLY --------------------
 def fetch_news_pool():
     """
-    India + exam-relevant pool:
-    - Google News India + topical sections
-    - Google News search RSS for govt/schemes/RBI/SEBI etc.
-    - PIB RSS
-    - AffairsCloud
+    ONLY authentic current-affairs / official sources.
+    NOTE: Some sites may not expose RSS reliably; we fail gracefully.
     """
-    feeds = []
+    feeds = [
+        # Official/primary
+        ("PIB", "https://pib.gov.in/RssMain.aspx?mod=0&ln=1"),
 
-    feeds += [
-        ("GoogleNews-India", "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"),
-        ("GoogleNews-Business", "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-IN&gl=IN&ceid=IN:en"),
-        ("GoogleNews-Science", "https://news.google.com/rss/headlines/section/topic/SCIENCE?hl=en-IN&gl=IN&ceid=IN:en"),
-        ("GoogleNews-Tech", "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en"),
-        ("GoogleNews-Sports", "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"),
-        ("GoogleNews-World", "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-IN&gl=IN&ceid=IN:en"),
+        # Well-known current affairs sites (RSS/feeds)
+        ("AffairsCloud", "https://affairscloud.com/feed/"),
+        ("GKToday", "https://www.gktoday.in/feed/"),
+
+        # Many candidates use these; if a feed fails, it’s okay (no crash)
+        ("JagranJosh-CA", "https://www.jagranjosh.com/rss/current-affairs.xml"),
+        ("Adda247-CA", "https://www.adda247.com/jobs/feed/"),
     ]
-
-    search_queries = [
-        ("Govt-Policy", "cabinet OR parliament OR bill OR ordinance OR notification India"),
-        ("Schemes", "scheme OR yojana OR mission OR initiative India"),
-        ("Appointments", "appointed OR appointment chairman CEO governor India"),
-        ("Reports-Index", "report OR survey OR index OR ranking India"),
-        ("RBI", "RBI circular OR RBI notification OR monetary policy OR bank regulation"),
-        ("SEBI", "SEBI circular OR SEBI guidelines OR capital markets India"),
-        ("Defence", "DRDO OR Indian Navy OR Indian Air Force OR Indian Army OR defence exercise"),
-        ("Environment", "tiger reserve OR national park OR pollution OR climate OR environment India"),
-        ("Summits", "summit OR G20 OR BRICS OR SCO OR ASEAN OR COP"),
-    ]
-
-    for label, q in search_queries:
-        q_enc = requests.utils.quote(q)
-        feeds.append(
-            (f"GoogleSearch-{label}",
-             f"https://news.google.com/rss/search?q={q_enc}&hl=en-IN&gl=IN&ceid=IN:en")
-        )
-
-    feeds.append(("PIB", "https://pib.gov.in/RssMain.aspx?mod=0&ln=1"))
-    feeds.append(("AffairsCloud", "https://affairscloud.com/feed/"))
 
     all_items = []
     for source, url in feeds:
@@ -291,7 +261,7 @@ def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
 
     today_items = [it for it in items if is_today(it)]
 
-    # If too few today, allow last 24h (still fresh)
+    # If too few today items across CA sources, allow last 24h (still fresh)
     if len(today_items) < MIN_TODAY_ITEMS_REQUIRED:
         cutoff = now_ist - dt.timedelta(hours=24)
         pool = [it for it in items if it.get("published_ist") and it["published_ist"] >= cutoff]
@@ -312,89 +282,84 @@ def filter_news_today_ist(items, avoid_title_norms, avoid_url_hashes):
     return out
 
 
-# -------------------- EXAM RELEVANCY SCORING (NO FIXED SECTIONS) --------------------
-HIGH_VALUE = [
-    # Govt/Polity/Administration
-    "cabinet", "parliament", "lok sabha", "rajya sabha", "bill", "ordinance", "notification", "gazette",
-    "ministry", "department", "commission", "authority", "supreme court", "high court",
-    # Schemes/Initiatives
-    "scheme", "yojana", "mission", "initiative", "programme", "policy", "guidelines",
-    # Economy/Banking
-    "rbi", "sebi", "irdai", "pfrda", "nabard", "sidbi", "bank", "inflation", "gdp", "fiscal", "budget",
-    "gst", "repo", "crr", "slr", "mclr", "npa", "upi", "digital payments", "forex",
-    # Defence
-    "drdo", "missile", "warship", "frigate", "submarine", "exercise", "navy", "air force", "army",
-    # Environment/Science
-    "national park", "tiger reserve", "biosphere", "wildlife", "climate", "pollution",
-    "isro", "satellite", "space", "quantum", "semiconductor", "ai", "vaccine",
-    # Awards/Reports/Indexes
-    "award", "rank", "ranking", "index", "report", "survey",
-    # Summits/International orgs (exam relevant)
+# -------------------- EXAM RELEVANCY SCORING (POSITIVE-ONLY) --------------------
+# No LOW_VALUE list (as per your instruction). Only positive scoring.
+POSITIVE_KEYWORDS = [
+    # Governance/Polity/Schemes
+    "cabinet", "parliament", "bill", "ordinance", "notification", "guidelines", "policy",
+    "scheme", "yojana", "mission", "programme", "initiative",
+    "commission", "authority", "tribunal", "supreme court", "high court",
+
+    # Economy/Banking/Regulation
+    "rbi", "sebi", "irdai", "pfrda", "nabard", "sidbi",
+    "bank", "inflation", "gdp", "budget", "gst", "repo", "crr", "slr", "npa", "upi", "forex",
+
+    # Reports/Indexes/Surveys
+    "report", "index", "ranking", "survey", "census",
+
+    # Defence/S&T/Environment
+    "drdo", "missile", "exercise", "navy", "air force", "army",
+    "isro", "satellite", "space", "ai", "quantum", "semiconductor",
+    "wildlife", "tiger reserve", "national park", "pollution", "climate",
+
+    # International orgs/summits (only when exam-relevant)
     "summit", "cop", "g20", "brics", "sco", "who", "un", "wto", "imf", "world bank",
-    # Appointments/Obituary (only if big)
-    "appointed", "elected", "chairman", "governor", "chief", "ceo", "president", "prime minister",
-]
 
-LOW_VALUE = [
-    "celebrity", "movie", "film", "box office", "dating", "rumour", "gossip", "instagram",
-    "fashion", "bollywood", "hollywood", "cricket wife", "trolled", "viral", "meme",
+    # Appointments/awards (exam-asked)
+    "appointed", "elected", "chairman", "governor", "ceo", "chief",
+    "award",
 ]
-
 
 def exam_relevancy_score(item: dict) -> int:
-    """
-    Higher score = more likely asked in SSC/Bank/PCS.
-    No fixed section allocation; this just ranks.
-    """
     title = _norm_text(item.get("title", ""))
     desc = _norm_text(item.get("description", ""))
     text = f"{title} {desc}"
 
     score = 0
 
-    # source boosts
+    # Source weighting (official > CA site > general)
     src = (item.get("source") or "").lower()
     if "pib" in src:
-        score += 8
+        score += 10
     if "affairscloud" in src:
-        score += 5
-    if "googlesearch" in src:
-        score += 2
+        score += 6
+    if "gktoday" in src:
+        score += 6
+    if "jagran" in src:
+        score += 4
+    if "adda" in src:
+        score += 4
 
-    # keyword boosts
-    for kw in HIGH_VALUE:
+    for kw in POSITIVE_KEYWORDS:
         if kw in text:
             score += 2
 
-    # penalties for low value
-    for kw in LOW_VALUE:
-        if kw in text:
-            score -= 6
-
-    # India relevance boost (soft)
+    # Slight boost for India context words (without using any blacklist)
     if "india" in text or "indian" in text:
         score += 2
 
-    # Very short/low info penalty
-    if len(title) < 30:
+    # Prefer informative titles
+    if len(title) < 25:
         score -= 1
 
     return score
 
 
-def rank_news_by_exam_relevance(items):
+def rank_news(items):
     scored = []
     for it in items:
         it = dict(it)
         it["exam_score"] = exam_relevancy_score(it)
         scored.append(it)
-
-    scored.sort(key=lambda x: (x.get("exam_score", 0), x.get("published_ist") or dt.datetime.min.replace(tzinfo=IST)), reverse=True)
+    scored.sort(
+        key=lambda x: (x.get("exam_score", 0), x.get("published_ist") or dt.datetime.min.replace(tzinfo=IST)),
+        reverse=True,
+    )
     return scored
 
 
-def _build_news_context(news_items, max_items):
-    picked = news_items[:max_items]
+def build_news_context(items, max_items: int):
+    picked = items[:max_items]
     lines = []
     for i, it in enumerate(picked, start=1):
         pub = it.get("published_ist")
@@ -405,120 +370,87 @@ def _build_news_context(news_items, max_items):
     return "\n".join(lines)
 
 
-# -------------------- OPENAI MCQ GENERATION (NO FIXED COUNTS, EXAM RELEVANCY FIRST) --------------------
-def generate_mcqs_from_ranked_news(today_str: str, news_context: str, avoid_questions: list, avoid_event_keys: list):
+# -------------------- OPENAI: EXAM-STANDARD FRAMING --------------------
+EXAM_STYLE_RULES = """
+You must frame questions exactly like SSC/Bank/PCS exams.
+
+Allowed MCQ TYPES (any mix; no fixed quotas):
+- Direct Fact (who/what/where/when)
+- Statement-based: "Consider the following statements..." (2 statements) ask which are correct
+- Pairing: "Which of the following pairs is/are correctly matched?"
+- Simplified Match (List-I / List-II) as 4 options
+
+Exam framing rules (hard):
+1) Start with: "Recently," OR "In the context of current affairs," OR "Which of the following..." OR "Consider the following statements:"
+2) No casual quiz tone, no emojis.
+3) Options must be same category (all persons / all organisations / all places / all schemes / all dates).
+4) Avoid vague stems like "According to a report" unless you name the report (e.g., NFHS, ASER, WEO, etc.).
+5) No opinion questions.
+6) Difficulty only Easy/Moderate.
+7) Explanation must have two parts within 200 chars: (a) current fact, (b) static GK link (definition/role/body).
+8) Use ONLY the given news items. Do not invent.
+"""
+
+def generate_mcqs_exam_style(today_str: str, news_context: str, avoid_questions: list, avoid_event_keys: list):
     system = (
-        "You create DAILY current affairs MCQs for SSC, Banking, and State PCS exams in ENGLISH.\n"
-        "CRITICAL CONSTRAINTS:\n"
-        "1) Use ONLY the news items provided by the user. Do NOT invent events.\n"
-        "2) Freshness: Use today's IST items (or last-24h fallback already included). Do not use old years.\n"
-        "3) Exam relevancy first: prefer govt/policy/schemes/reports/indexes/RBI/SEBI/banking/defence/environment/science/major awards/major sports results.\n"
-        "4) Avoid low-value entertainment/celebrity gossip.\n"
-        "5) Diversity (soft): Do not pick multiple MCQs from the same story/event. Each MCQ should come from a different item.\n\n"
-        "OUTPUT RULES:\n"
-        "- EXACTLY 10 MCQs.\n"
-        "- Each MCQ must have a UNIQUE event_key (3–8 words).\n"
-        "- correct_answer must EXACTLY match one of the 4 options.\n"
-        "- correct_option_id must be the index of correct_answer in options.\n"
-        "- All 4 options must be distinct.\n"
-        "- explanation <= 200 characters.\n"
-        "- Keep questions direct and factual (SSC/Bank/PCS style).\n"
+        "You are an exam question setter for SSC, Banking exams, and State PCS.\n"
+        "Use ONLY the provided news list.\n"
+        + EXAM_STYLE_RULES +
+        "\nReturn STRICT JSON as per schema."
     )
 
-    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:160]])
-    avoid_keys_block = "\n".join([f"- {a}" for a in (avoid_event_keys or [])[:160]])
+    avoid_block = "\n".join([f"- {a}" for a in (avoid_questions or [])[:180]])
+    avoid_keys_block = "\n".join([f"- {a}" for a in (avoid_event_keys or [])[:180]])
 
     user = (
         f"DATE (IST): {today_str}\n\n"
         "NEWS ITEMS (use ONLY these):\n"
         f"{news_context}\n\n"
-        "TASK:\n"
-        "- Create EXACTLY 10 MCQs based on the MOST EXAM-RELEVANT items.\n"
-        "- Do NOT follow any fixed quotas by category. Choose what is most likely for SSC/Bank/PCS.\n"
-        "- Ensure all 10 are from different news stories.\n\n"
+        "Create EXACTLY 10 MCQs from the MOST exam-relevant items.\n"
+        "- Each MCQ must be from a DIFFERENT news story.\n"
+        "- Do NOT follow any fixed quotas by category.\n\n"
         "AVOID repeating ANY of these prior questions/topics:\n"
         f"{avoid_block}\n\n"
         "AVOID these prior event_keys/topics:\n"
         f"{avoid_keys_block}\n\n"
-        "Return JSON exactly as per schema."
+        "For each MCQ, include:\n"
+        "- mcq_type (one allowed type)\n"
+        "- difficulty (Easy/Moderate)\n"
+        "- source_hint: just the source label like 'PIB' or 'GKToday' (no URL)\n"
     )
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "daily_ca_mcqs",
-                "strict": True,
-                "schema": SCHEMA,
-            }
-        },
+        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        text={"format": {"type": "json_schema", "name": "daily_ca_mcqs_examstyle", "strict": True, "schema": SCHEMA}},
     )
     return json.loads(resp.output_text)
 
 
-def generate_mcqs():
-    now_ist = dt.datetime.now(IST)
-    today_str = now_ist.date().isoformat()
+# -------------------- QUALITY FILTERS --------------------
+def looks_exam_style(q: dict) -> bool:
+    text = (q.get("question") or "").strip().lower()
+    starters = ("recently", "in the context", "which of the following", "consider the following statements")
+    if not text.startswith(starters):
+        return False
 
-    hist = load_history()
-    avoid_qs = (hist.get("questions", []) or [])[-180:]
-    avoid_event_keys = (hist.get("event_keys", []) or [])[-180:]
-    avoid_title_norms = set(hist.get("title_norms", []) or [])
-    avoid_url_hashes = set(hist.get("url_hashes", []) or [])
+    opts = q.get("options") or []
+    if len(opts) != 4:
+        return False
+    if len(set(o.strip() for o in opts)) != 4:
+        return False
 
-    raw_news = fetch_news_pool()
-    filtered_news = filter_news_today_ist(raw_news, avoid_title_norms, avoid_url_hashes)
+    if q.get("difficulty") not in ("Easy", "Moderate"):
+        return False
 
-    if len(filtered_news) < 18:
-        raise RuntimeError(f"Not enough fresh news items for {today_str} (IST). Found {len(filtered_news)}.")
+    exp = (q.get("explanation") or "").strip()
+    if len(exp) < 45:
+        return False
 
-    ranked = rank_news_by_exam_relevance(filtered_news)
-
-    # Take the top N by exam score
-    ranked_top = ranked[:RERANK_TOP_N]
-
-    # Build context for model (ranked list)
-    news_context = _build_news_context(ranked_top, max_items=CONTEXT_ITEMS)
-
-    mcq_set = generate_mcqs_from_ranked_news(
-        today_str=today_str,
-        news_context=news_context,
-        avoid_questions=avoid_qs,
-        avoid_event_keys=avoid_event_keys,
-    )
-
-    # Internal uniqueness guard
-    def qn(q): return _norm_text(q.get("question", ""))
-    def ekn(q): return _norm_text(q.get("event_key", ""))
-
-    seen_q, seen_ek = set(), set()
-    unique = []
-    for q in mcq_set["mcqs"]:
-        if qn(q) and qn(q) not in seen_q and ekn(q) and ekn(q) not in seen_ek:
-            seen_q.add(qn(q))
-            seen_ek.add(ekn(q))
-            unique.append(q)
-
-    if len(unique) < 10:
-        raise RuntimeError("Duplicate MCQs detected. Increase CONTEXT_ITEMS or MAX_NEWS_ITEMS and retry.")
-
-    mcq_set["date"] = today_str
-    mcq_set["mcqs"] = unique[:10]
-
-    used_title_norms = {_norm_text(it["title"]) for it in ranked_top[:CONTEXT_ITEMS]}
-    used_url_hashes = {_hash_url(it["link"]) for it in ranked_top[:CONTEXT_ITEMS]}
-    return mcq_set, used_title_norms, used_url_hashes
+    return True
 
 
-def validate_and_fix_mcqs(mcq_set: dict) -> dict:
-    """
-    Keep it safe: only fix option mapping/format. Do NOT browse extra sources here.
-    """
+def fix_mapping_and_keys(mcq_set: dict) -> dict:
     fixed = {"date": mcq_set["date"], "mcqs": []}
     seen_event_keys = set()
 
@@ -550,6 +482,7 @@ def validate_and_fix_mcqs(mcq_set: dict) -> dict:
         seen_event_keys.add(_norm_text(q["event_key"]))
 
         q["explanation"] = (q.get("explanation") or "")[:200]
+        q["source_hint"] = (q.get("source_hint") or "")[:120]
 
         fixed["mcqs"].append(q)
 
@@ -557,16 +490,64 @@ def validate_and_fix_mcqs(mcq_set: dict) -> dict:
     return fixed
 
 
+def generate_mcqs():
+    now_ist = dt.datetime.now(IST)
+    today_str = now_ist.date().isoformat()
+
+    hist = load_history()
+    avoid_qs = (hist.get("questions", []) or [])[-220:]
+    avoid_event_keys = (hist.get("event_keys", []) or [])[-220:]
+    avoid_title_norms = set(hist.get("title_norms", []) or [])
+    avoid_url_hashes = set(hist.get("url_hashes", []) or [])
+
+    raw = fetch_news_pool()
+    fresh = filter_news_today_ist(raw, avoid_title_norms, avoid_url_hashes)
+
+    if len(fresh) < 15:
+        raise RuntimeError(f"Not enough fresh items from authentic CA sources. Found {len(fresh)}.")
+
+    ranked = rank_news(fresh)[:RERANK_TOP_N]
+    news_context = build_news_context(ranked, max_items=CONTEXT_ITEMS)
+
+    best = None
+    best_good = 0
+
+    for attempt in range(4):
+        mcq_set = generate_mcqs_exam_style(today_str, news_context, avoid_qs, avoid_event_keys)
+        mcq_set["date"] = today_str
+        mcq_set = fix_mapping_and_keys(mcq_set)
+
+        good = [q for q in mcq_set["mcqs"] if looks_exam_style(q)]
+        if len(good) >= 10:
+            mcq_set["mcqs"] = good[:10]
+            best = mcq_set
+            best_good = 10
+            break
+
+        if len(good) > best_good:
+            best = mcq_set
+            best_good = len(good)
+
+        avoid_qs = avoid_qs + [q["question"] for q in mcq_set["mcqs"]]
+
+    if best is None or len(best["mcqs"]) < 10:
+        raise RuntimeError("Could not generate exam-standard MCQs. Retry once.")
+
+    best["mcqs"] = best["mcqs"][:10]
+
+    used_title_norms = {_norm_text(it["title"]) for it in ranked[:CONTEXT_ITEMS]}
+    used_url_hashes = {_hash_url(it["link"]) for it in ranked[:CONTEXT_ITEMS]}
+    return best, used_title_norms, used_url_hashes
+
+
 # -------------------- QUIZ POSTING --------------------
 def shuffle_options_and_fix_answer(q: dict) -> dict:
     options = q["options"]
     correct_text = options[q["correct_option_id"]]
-
     seed = q["question"] + correct_text
     rnd = random.Random(seed)
     shuffled = options[:]
     rnd.shuffle(shuffled)
-
     q["options"] = shuffled
     q["correct_option_id"] = shuffled.index(correct_text)
     q["correct_answer"] = correct_text
@@ -629,8 +610,6 @@ def post_to_channel(mcq_set: dict):
 # -------------------- MAIN --------------------
 def main():
     mcq_set, used_title_norms, used_url_hashes = generate_mcqs()
-    mcq_set = validate_and_fix_mcqs(mcq_set)
-
     post_to_channel(mcq_set)
 
     hist = load_history()
@@ -643,7 +622,7 @@ def main():
     )
     save_history(hist)
 
-    print("✅ Posted 10 quiz polls + message + score poll successfully.")
+    print("✅ Posted 10 exam-style quiz polls + message + score poll successfully.")
 
 
 if __name__ == "__main__":
