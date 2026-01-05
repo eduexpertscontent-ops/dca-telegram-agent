@@ -15,19 +15,16 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # e.g., @UPPCSSUCCESS
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# No repetition window
+# strict: only 10
+TARGET_MCQS = 10
+
+# history window for no repetition
 KEEP_LAST_DAYS = int(os.getenv("KEEP_LAST_DAYS", "30"))
+HISTORY_FILE = os.getenv("HISTORY_FILE", "mcq_history.json")
 
-# Posting volume
-MAX_POLLS_PER_DAY = int(os.getenv("MAX_POLLS_PER_DAY", "25"))  # can go beyond 10
-MIN_POLLS_TO_POST = int(os.getenv("MIN_POLLS_TO_POST", "10"))  # if less, still post what we have
-MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "40"))
-
+HTTP_TIMEOUT = 25
 SLEEP_BETWEEN_POLLS = float(os.getenv("SLEEP_BETWEEN_POLLS", "2"))
 SLEEP_AFTER_QUIZ = float(os.getenv("SLEEP_AFTER_QUIZ", "2"))
-
-HISTORY_FILE = os.getenv("HISTORY_FILE", "mcq_history.json")
-HTTP_TIMEOUT = 25
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -38,6 +35,8 @@ UA = (
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 client = OpenAI()  # reads OPENAI_API_KEY from environment
 
+# how many candidate pages to look at from list pages
+MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "50"))
 
 # ==================== TIME HELPERS ====================
 def now_ist() -> dt.datetime:
@@ -49,11 +48,8 @@ def ist_today_date() -> dt.date:
 def ist_today_str() -> str:
     return ist_today_date().isoformat()
 
-def ist_yesterday_date() -> dt.date:
-    return ist_today_date() - dt.timedelta(days=1)
-
 def ist_yesterday_str() -> str:
-    return ist_yesterday_date().isoformat()
+    return (ist_today_date() - dt.timedelta(days=1)).isoformat()
 
 def month_name_lower(m: int) -> str:
     names = [
@@ -61,7 +57,6 @@ def month_name_lower(m: int) -> str:
         "july","august","september","october","november","december"
     ]
     return names[m-1]
-
 
 # ==================== TELEGRAM HELPERS ====================
 def tg(method: str, payload: dict) -> dict:
@@ -84,10 +79,10 @@ def tg(method: str, payload: dict) -> dict:
 def post_info(text: str):
     tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True})
 
-def post_header(date_str: str, total: int):
+def post_header(date_str: str):
     tg("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": f"🧠 Daily Current Affairs Quiz (SSC/PCS) — {date_str}\n\nTotal Questions: {total}\n\nQuiz polls below 👇",
+        "text": f"🧠 Daily Current Affairs MCQ — {date_str}\n\nQuiz polls below 👇",
         "disable_web_page_preview": True
     })
 
@@ -98,30 +93,14 @@ def post_closure():
         "disable_web_page_preview": True
     })
 
-def post_score_poll(date_str: str, total: int):
-    # Telegram allows max 10 options in poll
-    if total <= 10:
-        opts = [f"{i}/{total}" for i in range(total, max(total-9, -1), -1)][:10]
-    else:
-        opts = [
-            f"{total} ✅",
-            f"{total-1}–{total-2}",
-            f"{total-3}–{total-5}",
-            f"{total-6}–{total-8}",
-            f"{total-9}–{total-12}",
-            f"{max(total-13,0)}–{max(total-18,0)}",
-            f"{max(total-19,0)}–{max(total-25,0)}",
-            "Below that 😅",
-        ][:10]
-
+def post_score_poll(date_str: str):
     tg("sendPoll", {
         "chat_id": TELEGRAM_CHAT_ID,
-        "question": f"📊 Vote your score ({date_str}) ✅\nHow many were correct?",
-        "options": opts,
+        "question": f"📊 Vote your score ({date_str}) ✅\nHow many were correct out of 10?",
+        "options": ["10/10 🏆", "9/10 🔥", "8/10 ✅", "7/10 👍", "6/10 🙂", "5/10 📘", "4/10 🧠", "3 or less 😅"],
         "is_anonymous": True,
         "allows_multiple_answers": False,
     })
-
 
 # ==================== HISTORY (NO REPEAT) ====================
 def load_history() -> dict:
@@ -159,24 +138,21 @@ def update_history(hist: dict, date_str: str, used_urls: List[str], used_fact_ha
         "q_hashes": used_q_hashes,
     }
 
-    # trim old dates
     all_dates = sorted(hist["dates"].keys())
     if len(all_dates) > KEEP_LAST_DAYS:
         for d in all_dates[:-KEEP_LAST_DAYS]:
             hist["dates"].pop(d, None)
 
-    # rebuild flattened caches
     uhs, fhs, qhs = [], [], []
     for d in sorted(hist["dates"].keys()):
         uhs.extend(hist["dates"][d].get("url_hashes", []))
         fhs.extend(hist["dates"][d].get("fact_hashes", []))
         qhs.extend(hist["dates"][d].get("q_hashes", []))
 
-    hist["url_hashes"] = uhs[-6000:]
-    hist["fact_hashes"] = fhs[-20000:]
-    hist["q_hashes"] = qhs[-20000:]
+    hist["url_hashes"] = uhs[-4000:]
+    hist["fact_hashes"] = fhs[-12000:]
+    hist["q_hashes"] = qhs[-12000:]
     return hist
-
 
 # ==================== HTTP + TEXT CLEAN ====================
 def http_get(url: str) -> str:
@@ -234,17 +210,12 @@ def guess_date_from_url(url: str) -> Optional[str]:
     m = re.search(r"/(20\d{2})-(\d{2})-(\d{2})/", u)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    m = re.search(r"(\d{1,2})-(\w+)-(20\d{2})", u)
-    if m:
-        # not reliable; ignore
-        return None
     m = re.search(r"(\d{2})-(\d{2})-(20\d{2})", u)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return None
 
-
-# ==================== SOURCES ====================
+# ==================== SOURCES (DATE-WISE) ====================
 def pw_url_for_date(d: dt.date) -> str:
     # example: https://www.pw.live/ssc/exams/daily-current-affairs-today-5-january-2026
     return f"https://www.pw.live/ssc/exams/daily-current-affairs-today-{d.day}-{month_name_lower(d.month)}-{d.year}"
@@ -259,22 +230,9 @@ def collect_pw(date_iso: str) -> List[Dict[str, str]]:
     title = extract_title(html) or f"PW Daily Current Affairs {date_iso}"
     text = strip_html(html)
 
-    # keep a focused chunk to reduce noise
-    low = text.lower()
-    anchors = [
-        "most important current affairs",
-        "daily current affairs",
-        "today current affairs",
-        "current affairs today"
-    ]
-    for a in anchors:
-        idx = low.find(a)
-        if idx != -1:
-            text = text[idx: idx + 9000]
-            break
-    else:
-        text = text[:9000]
-
+    # keep a tight chunk to reduce noise
+    # (avoid footer, navigation, etc.)
+    text = text[:12000]
     return [{
         "source": "PW",
         "url": url,
@@ -283,20 +241,19 @@ def collect_pw(date_iso: str) -> List[Dict[str, str]]:
         "text": text
     }]
 
-def collect_drishti(date_iso: str) -> List[Dict[str, str]]:
+def collect_drishti_editorials(date_iso: str) -> List[Dict[str, str]]:
     base = "https://www.drishtiias.com/current-affairs-news-analysis-editorials"
     try:
         html = http_get(base)
     except Exception:
         return []
 
-    # typical links include /current-affairs-news-analysis-editorials/...
+    # match their daily updates / analysis URLs
     links = re.findall(
-        r'href=["\'](https://www\.drishtiias\.com/current-affairs-news-analysis-editorials/[^"\']+)["\']',
+        r'href=["\'](https://www\.drishtiias\.com/(?:daily-updates/daily-news-analysis|daily-news-analysis)/[^"\']+)["\']',
         html,
         re.I
     )
-    links = [u for u in links if "amp" not in u]
     links = list(dict.fromkeys(links))[:MAX_ARTICLES_PER_SOURCE]
 
     out = []
@@ -304,102 +261,103 @@ def collect_drishti(date_iso: str) -> List[Dict[str, str]]:
         try:
             page = http_get(url)
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            # strict: only today
-            if pub and pub != date_iso:
+            if pub != date_iso:
                 continue
-            # if pub missing, still accept (Drishti sometimes hides it)
-            title = extract_title(page) or "DrishtiIAS Current Affairs"
-            text = strip_html(page)[:9000]
-            out.append({"source": "DrishtiIAS", "url": url, "title": title, "date": date_iso, "text": text})
+            title = extract_title(page) or "Drishti Current Affairs"
+            text = strip_html(page)[:12000]
+            out.append({
+                "source": "DrishtiIAS",
+                "url": url,
+                "title": title,
+                "date": date_iso,
+                "text": text
+            })
         except Exception:
             continue
-
-    # IMPORTANT: to avoid old content from Drishti list pages, we keep only those
-    # whose text includes the target date string at least once (weak check)
-    # If your Drishti pages don't show date, this filter can over-reject.
-    # We'll keep it soft: only apply if we already have many.
-    if len(out) >= 6:
-        out2 = []
-        for a in out:
-            if date_iso in a["text"]:
-                out2.append(a)
-        if len(out2) >= 2:
-            out = out2
-
-    return out[:MAX_ARTICLES_PER_SOURCE]
+    return out
 
 def collect_currentaffairsworld(date_iso: str) -> List[Dict[str, str]]:
-    base = "https://currentaffairsworld.in/category/current-affairs/"
+    base = "https://currentaffairsworld.in/"
     try:
         html = http_get(base)
     except Exception:
         return []
 
     links = re.findall(r'href=["\'](https://currentaffairsworld\.in/[^"\']+)["\']', html, re.I)
-    links = [u for u in links if "wp-content" not in u]
     links = list(dict.fromkeys(links))[:MAX_ARTICLES_PER_SOURCE]
 
     out = []
     for url in links:
         try:
+            # only keep pages that look like daily CA and match the date
             page = http_get(url)
             pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub and pub != date_iso:
+            if pub != date_iso:
                 continue
             title = extract_title(page) or "CurrentAffairsWorld"
-            text = strip_html(page)[:9000]
-            out.append({"source": "CurrentAffairsWorld", "url": url, "title": title, "date": date_iso, "text": text})
+            text = strip_html(page)[:12000]
+            out.append({
+                "source": "CurrentAffairsWorld",
+                "url": url,
+                "title": title,
+                "date": date_iso,
+                "text": text
+            })
         except Exception:
             continue
-    return out[:MAX_ARTICLES_PER_SOURCE]
+    return out
 
 def collect_fresh_articles() -> Tuple[str, List[Dict[str, str]]]:
     today = ist_today_str()
     yday = ist_yesterday_str()
 
-    # today first
-    today_articles = []
-    today_articles.extend(collect_pw(today))
-    today_articles.extend(collect_drishti(today))
-    today_articles.extend(collect_currentaffairsworld(today))
+    arts = []
+    arts.extend(collect_pw(today))
+    arts.extend(collect_drishti_editorials(today))
+    arts.extend(collect_currentaffairsworld(today))
 
-    print(f"✅ PW: {len([a for a in today_articles if a['source']=='PW'])} items for {today}")
-    print(f"✅ DrishtiIAS: {len([a for a in today_articles if a['source']=='DrishtiIAS'])} items for {today}")
-    print(f"✅ CurrentAffairsWorld: {len([a for a in today_articles if a['source']=='CurrentAffairsWorld'])} items for {today}")
+    print(f"✅ PW: {len([a for a in arts if a['source']=='PW'])} items for {today}")
+    print(f"✅ DrishtiIAS: {len([a for a in arts if a['source']=='DrishtiIAS'])} items for {today}")
+    print(f"✅ CurrentAffairsWorld: {len([a for a in arts if a['source']=='CurrentAffairsWorld'])} items for {today}")
 
-    # fallback yesterday ONLY if today is empty/useless
-    if len(today_articles) < 1:
-        yday_articles = []
-        yday_articles.extend(collect_pw(yday))
-        yday_articles.extend(collect_drishti(yday))
-        yday_articles.extend(collect_currentaffairsworld(yday))
-        if yday_articles:
-            return yday, yday_articles
+    # fallback to yesterday ONLY if today's list is empty
+    if not arts:
+        arts2 = []
+        arts2.extend(collect_pw(yday))
+        arts2.extend(collect_drishti_editorials(yday))
+        arts2.extend(collect_currentaffairsworld(yday))
+        if arts2:
+            return yday, arts2
 
-    return today, today_articles
+    return today, arts
 
-
-# ==================== QUALITY FILTERS ====================
+# ==================== QUALITY RULES ====================
 BAD_OPTIONS = {"all of the above", "none of the above", "all above", "none"}
-
-STATIC_GK_PHRASES = [
+STATIC_GK_HINTS = [
     "capital of", "currency of", "largest planet", "highest mountain",
-    "national animal", "national anthem", "trick", "mnemonic",
-    "one-liner", "static gk"
+    "national animal", "national anthem", "trick", "mnemonic", "one-liner", "static gk"
+]
+VAGUE_FACT_HINTS = [
+    "the article discusses", "the video explains", "it encourages", "it is about",
+    "this content", "watch", "subscribe", "like and share"
 ]
 
-META_PHRASES = [
-    "youtube", "video", "channel", "subscribe", "like", "share", "comment",
-    "shorts", "watch", "playlist", "hosted on", "follow us", "telegram"
-]
+def looks_like_current_affairs_fact(s: str) -> bool:
+    """Reject vague/generic or static GK-like facts."""
+    low = (s or "").lower()
+    if any(p in low for p in STATIC_GK_HINTS):
+        return False
+    if any(p in low for p in VAGUE_FACT_HINTS):
+        return False
 
-# Keep it SSC/PCS friendly (avoid deep banking/market terms)
-BANKING_BLOCK = [
-    "rbi", "sebi", "irdai", "pfrda", "repo", "reverse repo", "crr", "slr",
-    "upi", "neft", "rtgs", "imps", "ipo", "stock", "share market",
-    "mutual fund", "cryptocurrency", "bitcoin"
-]
-ECON_ALLOW = ["gdp", "cpi", "inflation", "budget", "gst", "fiscal", "export", "import", "trade"]
+    # Must contain at least one strong anchor:
+    # - a number OR
+    # - a proper noun-like token (capitalized word) OR
+    # - an acronym (2+ caps)
+    has_number = bool(re.search(r"\b\d{1,4}\b", s))
+    has_acronym = bool(re.search(r"\b[A-Z]{2,}\b", s))
+    has_proper = bool(re.search(r"\b[A-Z][a-z]{2,}\b", s))
+    return has_number or has_acronym or has_proper
 
 def is_exam_style(q: str) -> bool:
     q = (q or "").strip()
@@ -410,37 +368,24 @@ def is_exam_style(q: str) -> bool:
         return False
     if low.startswith(("with reference to", "consider the following statements")):
         return False
-    if "section" in low or "category" in low:
-        return False
-    if any(p in low for p in STATIC_GK_PHRASES):
-        return False
-    if any(p in low for p in META_PHRASES):
+    # reject “meta” questions
+    if any(x in low for x in ["the article", "the passage", "the text", "the page", "the author", "the video", "channel"]):
         return False
     return True
 
-def banking_blocked(text: str) -> bool:
-    low = (text or "").lower()
-    if any(k in low for k in BANKING_BLOCK):
-        # allow macro words if NOT the finance regulator/payment infra words
-        if any(x in low for x in ECON_ALLOW) and not any(y in low for y in ["rbi","sebi","upi","neft","rtgs","repo","crr","slr"]):
-            return False
-        return True
-    return False
-
-
-# ==================== LLM: FACTS + MCQs ====================
+# ==================== LLM: FACTS + MCQs (STRICT) ====================
 FACTS_SCHEMA = {
     "type": "object",
     "properties": {
         "facts": {
             "type": "array",
             "minItems": 10,
-            "maxItems": 50,
+            "maxItems": 60,
             "items": {
                 "type": "object",
                 "properties": {
                     "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
-                    "fact": {"type": "string", "minLength": 12, "maxLength": 260},
+                    "fact": {"type": "string", "minLength": 15, "maxLength": 240},
                 },
                 "required": ["event_key", "fact"],
                 "additionalProperties": False,
@@ -455,7 +400,7 @@ MCQ_SCHEMA = {
     "type": "object",
     "properties": {
         "event_key": {"type": "string", "minLength": 3, "maxLength": 80},
-        "question": {"type": "string", "minLength": 10, "maxLength": 260},
+        "question": {"type": "string", "minLength": 12, "maxLength": 240},
         "options": {
             "type": "array",
             "minItems": 4,
@@ -464,7 +409,7 @@ MCQ_SCHEMA = {
         },
         "correct_option_id": {"type": "integer", "minimum": 0, "maximum": 3},
         "correct_answer": {"type": "string", "minLength": 1, "maxLength": 80},
-        "explanation": {"type": "string", "maxLength": 200},
+        "explanation": {"type": "string", "maxLength": 160},
         "source_title": {"type": "string", "minLength": 3, "maxLength": 200},
         "source_url": {"type": "string", "minLength": 5, "maxLength": 400},
         "source": {"type": "string", "minLength": 2, "maxLength": 80},
@@ -475,22 +420,21 @@ MCQ_SCHEMA = {
 
 def extract_facts(article: Dict[str, str]) -> List[Dict[str, str]]:
     system = (
-        "You are an expert SSC/PCS Current Affairs setter.\n"
-        "Extract ONLY short, verifiable CURRENT AFFAIRS facts from the provided text.\n"
-        "Hard Rules:\n"
-        "- Use ONLY given text. No outside info.\n"
-        "- Facts must be specific (names, places, awards, summits, reports, indices, appointments, schemes, sports results).\n"
-        "- Avoid: video/channel/subscribe, tricks/mnemonics, static GK, history background, generic explanations.\n"
-        "- Avoid deep banking/markets; macro economy (GDP/CPI/Budget) is allowed.\n"
-        "- Return 10–50 facts.\n"
-        "- event_key: 3–8 words summarizing the fact topic.\n"
+        "Extract ONLY exam-relevant DAILY CURRENT AFFAIRS facts from the given text.\n"
+        "STRICT RULES:\n"
+        "- Facts must be directly supported by the text.\n"
+        "- Each fact must include a SPECIFIC anchor: person/org/place/award/rank/number/date/project.\n"
+        "- Reject vague facts (e.g., 'the article discusses...').\n"
+        "- Reject static GK, tricks, and long explanations.\n"
+        "- Return 10–60 short, crisp facts.\n"
+        "- event_key: 3–8 words naming the topic.\n"
     )
     user = {
         "source": article["source"],
         "title": article["title"],
         "url": article["url"],
         "date": article["date"],
-        "text": article["text"][:9000],
+        "text": article["text"][:12000],
     }
 
     resp = client.responses.create(
@@ -502,77 +446,26 @@ def extract_facts(article: Dict[str, str]) -> List[Dict[str, str]]:
         text={"format": {"type": "json_schema", "name": "facts_schema", "strict": True, "schema": FACTS_SCHEMA}},
     )
     data = json.loads(resp.output_text)
-    facts = data.get("facts", []) or []
-
-    # remove meta/video/trick/static gk/banking-ish facts
-    cleaned = []
+    facts = data.get("facts", [])
+    # local quality filter
+    good = []
     for f in facts:
-        ft = (f.get("fact") or "").lower()
-        ek = (f.get("event_key") or "").lower()
-        if any(p in ft for p in META_PHRASES) or any(p in ek for p in META_PHRASES):
-            continue
-        if any(p in ft for p in STATIC_GK_PHRASES):
-            continue
-        if banking_blocked(ft):
-            continue
-        if len((f.get("fact") or "").strip()) < 12:
-            continue
-        cleaned.append(f)
-
-    return cleaned
-
-def mcq_ok(mcq: Dict[str, Any]) -> bool:
-    qtext = (mcq.get("question", "") or "").strip()
-    qlow = qtext.lower()
-
-    if any(p in qlow for p in META_PHRASES):
-        return False
-    if any(p in qlow for p in STATIC_GK_PHRASES):
-        return False
-    if banking_blocked(qtext + " " + " ".join(mcq.get("options", []) or []) + " " + (mcq.get("explanation","") or "")):
-        return False
-
-    if not is_exam_style(qtext):
-        return False
-
-    opts = mcq.get("options") or []
-    if len(opts) != 4:
-        return False
-    if len(set(_norm_text(o) for o in opts)) != 4:
-        return False
-    if any(_norm_text(o) in BAD_OPTIONS for o in opts):
-        return False
-
-    ca = mcq.get("correct_answer", "")
-    if ca not in opts:
-        return False
-
-    mcq["correct_option_id"] = opts.index(ca)
-    return True
-
-def shuffle_options(mcq: Dict[str, Any]) -> Dict[str, Any]:
-    options = mcq["options"]
-    correct_text = options[mcq["correct_option_id"]]
-    rnd = random.Random(_h(mcq["question"] + correct_text))
-    shuffled = options[:]
-    rnd.shuffle(shuffled)
-    mcq["options"] = shuffled
-    mcq["correct_option_id"] = shuffled.index(correct_text)
-    mcq["correct_answer"] = correct_text
-    return mcq
+        if looks_like_current_affairs_fact(f.get("fact", "")):
+            good.append(f)
+    return good
 
 def build_mcq_from_fact(article: Dict[str, str], fact_item: Dict[str, str]) -> Optional[Dict[str, Any]]:
     system = (
-        "You are a professional SSC/PCS exam MCQ setter.\n"
-        "Create ONE easy-to-moderate exam-style Current Affairs MCQ from the FACT.\n"
-        "Hard Rules:\n"
-        "- Use ONLY the given fact. Do NOT add outside knowledge.\n"
-        "- Question must start with Which/What/Who/Where/When and end with '?'.\n"
-        "- Make it practical and exam-relevant (not vague).\n"
-        "- 4 options: same category, plausible, short.\n"
-        "- No 'All of the above' or 'None of the above'.\n"
-        "- Explanation <= 200 characters, directly justifying correct answer.\n"
-        "- Avoid: video/channel/subscribe/tricks/static GK.\n"
+        "Create ONE exam-standard Current Affairs MCQ from the given FACT.\n"
+        "STRICT RULES:\n"
+        "- Use ONLY the fact. Do not add outside info.\n"
+        "- Question must be direct, objective, exam-like.\n"
+        "- Must start with Which/What/Who/Where/When and end with '?'.\n"
+        "- Must target a SPECIFIC anchor from the fact (name/organisation/place/number).\n"
+        "- 4 options, SAME CATEGORY, plausible.\n"
+        "- No 'All of the above'/'None of the above'.\n"
+        "- Explanation <= 160 characters, factual.\n"
+        "Return JSON only.\n"
     )
     user = {
         "event_key": fact_item.get("event_key", ""),
@@ -589,39 +482,77 @@ def build_mcq_from_fact(article: Dict[str, str], fact_item: Dict[str, str]) -> O
     )
     mcq = json.loads(resp.output_text)
 
+    # attach but NEVER post to channel
     mcq["source"] = article["source"]
     mcq["source_title"] = article["title"][:200]
     mcq["source_url"] = article["url"][:400]
 
     return mcq if mcq_ok(mcq) else None
 
+def mcq_ok(mcq: Dict[str, Any]) -> bool:
+    q = mcq.get("question", "")
+    if not is_exam_style(q):
+        return False
 
-# ==================== BUILD DAILY MCQs ====================
+    # reject static GK-looking questions
+    if any(p in q.lower() for p in STATIC_GK_HINTS):
+        return False
+
+    opts = mcq.get("options") or []
+    if len(opts) != 4:
+        return False
+    if len(set(_norm_text(o) for o in opts)) != 4:
+        return False
+    if any(_norm_text(o) in BAD_OPTIONS for o in opts):
+        return False
+
+    ca = mcq.get("correct_answer", "")
+    if ca not in opts:
+        return False
+
+    # fix correct_option_id
+    mcq["correct_option_id"] = opts.index(ca)
+
+    # Ensure the question contains at least one anchored token also present in fact_key
+    if not looks_like_current_affairs_fact(q):
+        return False
+
+    return True
+
+def shuffle_options(mcq: Dict[str, Any]) -> Dict[str, Any]:
+    options = mcq["options"]
+    correct_text = options[mcq["correct_option_id"]]
+    rnd = random.Random(_h(mcq["question"] + correct_text))
+    shuffled = options[:]
+    rnd.shuffle(shuffled)
+    mcq["options"] = shuffled
+    mcq["correct_option_id"] = shuffled.index(correct_text)
+    mcq["correct_answer"] = correct_text
+    return mcq
+
+# ==================== BUILD DAILY MCQs (EXACTLY 10) ====================
 def build_daily_mcqs() -> Tuple[str, List[Dict[str, Any]], List[str], List[str], List[str]]:
     date_str, articles = collect_fresh_articles()
     if not articles:
         return date_str, [], [], [], []
 
     hist = load_history()
-    used_url_hashes = set(hist.get("url_hashes", [])[-6000:])
-    used_fact_hashes = set(hist.get("fact_hashes", [])[-20000:])
-    used_q_hashes = set(hist.get("q_hashes", [])[-20000:])
+    used_url_hashes = set(hist.get("url_hashes", [])[-4000:])
+    used_fact_hashes = set(hist.get("fact_hashes", [])[-12000:])
+    used_q_hashes = set(hist.get("q_hashes", [])[-12000:])
 
-    # de-dup articles by url
-    unique_articles = []
+    # dedup articles by url + skip repeated URLs
     seen_urls = set()
+    unique_articles = []
     for a in articles:
         if a["url"] in seen_urls:
             continue
         seen_urls.add(a["url"])
-
-        # absolute "no repeat news pages"
         if _h(a["url"]) in used_url_hashes:
             continue
-
         unique_articles.append(a)
 
-    # deterministic shuffle
+    # deterministic shuffle for the day
     rnd = random.Random(date_str)
     rnd.shuffle(unique_articles)
 
@@ -631,7 +562,7 @@ def build_daily_mcqs() -> Tuple[str, List[Dict[str, Any]], List[str], List[str],
     used_q_hashes_today: List[str] = []
 
     for art in unique_articles:
-        if len(mcqs) >= MAX_POLLS_PER_DAY:
+        if len(mcqs) >= TARGET_MCQS:
             break
 
         try:
@@ -645,25 +576,18 @@ def build_daily_mcqs() -> Tuple[str, List[Dict[str, Any]], List[str], List[str],
 
         used_urls_today.append(art["url"])
 
-        # shuffle facts for variety
-        rnd2 = random.Random(_h(art["url"] + date_str))
-        facts2 = facts[:]
-        rnd2.shuffle(facts2)
-
-        for f in facts2:
-            if len(mcqs) >= MAX_POLLS_PER_DAY:
+        for f in facts:
+            if len(mcqs) >= TARGET_MCQS:
                 break
 
             fact_text = (f.get("fact") or "").strip()
-            if len(fact_text) < 12:
+            if not looks_like_current_affairs_fact(fact_text):
                 continue
 
-            # No repetition by fact
             fh = _h(_norm_text(fact_text))
             if fh in used_fact_hashes:
                 continue
 
-            # build mcq
             try:
                 mcq = build_mcq_from_fact(art, f)
             except Exception as e:
@@ -686,10 +610,9 @@ def build_daily_mcqs() -> Tuple[str, List[Dict[str, Any]], List[str], List[str],
 
     return date_str, mcqs, used_urls_today, used_fact_hashes_today, used_q_hashes_today
 
-
-# ==================== POST ====================
+# ==================== POST (NO SOURCES EVER) ====================
 def post_mcqs(date_str: str, mcqs: List[Dict[str, Any]]):
-    post_header(date_str, len(mcqs))
+    post_header(date_str)
 
     for i, q in enumerate(mcqs, start=1):
         q = shuffle_options(q)
@@ -707,23 +630,22 @@ def post_mcqs(date_str: str, mcqs: List[Dict[str, Any]]):
     time.sleep(SLEEP_AFTER_QUIZ)
     post_closure()
     time.sleep(2)
-    post_score_poll(date_str, len(mcqs))
-
+    post_score_poll(date_str)
 
 # ==================== MAIN ====================
 def main():
     date_str, mcqs, used_urls, used_fact_hashes, used_q_hashes = build_daily_mcqs()
 
-    if not mcqs:
-        # No source links, no technical details in Telegram
-        print(f"⚠️ Could not generate MCQs for {date_str}. Will try again tomorrow.")
-        post_info(f"⚠️ Today’s Current Affairs MCQs could not be generated ({date_str}).\nTry again tomorrow ✅")
+    # HARD RULE: publish ONLY if we have exactly 10 good MCQs
+    if len(mcqs) < TARGET_MCQS:
+        print(f"⚠️ Only {len(mcqs)} MCQs generated for {date_str}. Not posting to avoid low quality.")
+        post_info(f"⚠️ Today’s MCQs couldn’t be generated with required quality ({date_str}).\nWill try again tomorrow ✅")
         return
 
-    # post whatever we got; don't crash if less than MIN_POLLS_TO_POST
+    # post exactly 10
+    mcqs = mcqs[:TARGET_MCQS]
     post_mcqs(date_str, mcqs)
 
-    # update history
     hist = load_history()
     hist = update_history(hist, date_str, used_urls, used_fact_hashes, used_q_hashes)
     save_history(hist)
@@ -732,4 +654,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
