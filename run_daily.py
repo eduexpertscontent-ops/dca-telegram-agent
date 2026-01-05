@@ -92,16 +92,6 @@ MCQ_ITEM_SCHEMA = {
     "additionalProperties": False,
 }
 
-SET_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "date": {"type": "string"},
-        "mcqs": {"type": "array", "minItems": 10, "maxItems": 10, "items": MCQ_ITEM_SCHEMA},
-    },
-    "required": ["date", "mcqs"],
-    "additionalProperties": False,
-}
-
 
 # -------------------- HISTORY (NO-REPEAT ACROSS DAYS) --------------------
 def load_history() -> dict:
@@ -162,7 +152,7 @@ def update_history(hist: dict, mcq_set: dict, keep_last_days: int) -> dict:
     return hist
 
 
-# -------------------- HTTP + LIGHT HTML PARSING (NO RSS) --------------------
+# -------------------- HTTP + LIGHT HTML PARSING --------------------
 def http_get(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -224,135 +214,32 @@ def guess_date_from_url(url: str) -> Optional[str]:
     m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", u)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.search(r"/(20\d{2})-(\d{2})-(\d{2})/", u)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return None
 
-def fetch_article_snippet(url: str, max_chars: int = 1000) -> str:
+def fetch_article_snippet(url: str, max_chars: int = 1100) -> str:
     html = http_get(url)
     return strip_html(html)[:max_chars]
 
 
-# -------------------- SOURCES (ALLOWED) --------------------
-def collect_affairscloud(date_iso: str) -> List[Dict[str, str]]:
-    base = "https://affairscloud.com/current-affairs-ca/current-affairs-today/"
-    html = http_get(base)
-    links = re.findall(r'href=["\'](https://affairscloud\.com/current-affairs-[^"\']+)["\']', html, re.I)
-    links = list(dict.fromkeys(links))[:70]
+# -------------------- SOURCE FILTERS (BLOCK META/LISTS) --------------------
+# ✅ UPDATED (stronger) list to avoid "Important Days/Appointments" pages
+BLOCK_TITLE_PHRASES = [
+    # Meta / category / list pages
+    "important days", "appointments", "current affairs section",
+    "daily current affairs pdf", "today current affairs pdf", "current affairs pdf",
+    "weekly current affairs", "monthly current affairs", "capsule", "compilation",
+    "mcq", "quiz", "practice questions", "questions and answers",
+    "obituary current affairs",
+    "year 2026", "2026 important days", "2026 appointments",
+]
 
-    items = []
-    for url in links:
-        try:
-            page = http_get(url)
-            title = extract_title(page) or "AffairsCloud Current Affairs"
-            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub == date_iso:
-                items.append({"source": "AffairsCloud", "url": url, "title": title, "date": pub})
-        except Exception:
-            continue
-    return items
-
-def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
-    base = "https://www.gktoday.in/current-affairs/"
-    html = http_get(base)
-    links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
-    links = [u for u in links if "wp-content" not in u]
-    links = list(dict.fromkeys(links))[:120]
-
-    items = []
-    for url in links:
-        try:
-            page = http_get(url)
-            title = extract_title(page)
-            if not title:
-                continue
-            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub == date_iso:
-                items.append({"source": "GKToday", "url": url, "title": title, "date": pub})
-        except Exception:
-            continue
-    return items
-
-def collect_adda247(date_iso: str) -> List[Dict[str, str]]:
-    base = "https://currentaffairs.adda247.com/"
-    html = http_get(base)
-    links = re.findall(r'href=["\'](https://currentaffairs\.adda247\.com/[^"\']+/)["\']', html, re.I)
-    links = [u for u in links if "category" not in u and "tag" not in u and "/page/" not in u]
-    links = list(dict.fromkeys(links))[:160]
-
-    items = []
-    for url in links:
-        try:
-            page = http_get(url)
-            title = extract_title(page)
-            if not title:
-                continue
-            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub == date_iso:
-                items.append({"source": "Adda247", "url": url, "title": title, "date": pub})
-        except Exception:
-            continue
-    return items
-
-def collect_jagranjosh(date_iso: str) -> List[Dict[str, str]]:
-    base = "https://www.jagranjosh.com/current-affairs"
-    html = http_get(base)
-    links = re.findall(r'href=["\'](https://www\.jagranjosh\.com/[^"\']+)["\']', html, re.I)
-    links = [u for u in links if "/general-knowledge/" in u or "/current-affairs/" in u]
-    links = list(dict.fromkeys(links))[:160]
-
-    items = []
-    for url in links:
-        try:
-            page = http_get(url)
-            title = extract_title(page)
-            if not title:
-                continue
-            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
-            if pub == date_iso:
-                items.append({"source": "JagranJosh", "url": url, "title": title, "date": pub})
-        except Exception:
-            continue
-    return items
-
-def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
-    today = ist_today_str()
-    yesterday = ist_yesterday_str()
-    sources = [collect_affairscloud, collect_gktoday, collect_adda247, collect_jagranjosh]
-
-    all_today = []
-    for fn in sources:
-        try:
-            got = fn(today)
-            print(f"✅ {fn.__name__}: {len(got)} items for {today}")
-            all_today.extend(got)
-        except Exception as e:
-            print(f"⚠️ {fn.__name__} failed: {e}")
-
-    # Dedup by URL
-    seen = set()
-    dedup = []
-    for it in all_today:
-        h = _url_hash(it["url"])
-        if h not in seen:
-            seen.add(h)
-            dedup.append(it)
-
-    # Fallback yesterday (only if not enough)
-    if len(dedup) < 18:
-        all_yday = []
-        for fn in sources:
-            try:
-                all_yday.extend(fn(yesterday))
-            except Exception:
-                continue
-        for it in all_yday:
-            h = _url_hash(it["url"])
-            if h not in seen:
-                seen.add(h)
-                it = dict(it)
-                it["date"] = yesterday
-                dedup.append(it)
-
-    return today, dedup
+STATIC_GK_PHRASES = [
+    "queen of the hills", "national anthem", "national animal", "largest planet",
+    "capital of", "currency of", "highest mountain"
+]
 
 
 # -------------------- BAN BANKING/FINANCE (ALLOW ECONOMY MACRO) --------------------
@@ -378,49 +265,178 @@ def is_banking_finance_related(title: str, snippet: str) -> bool:
     return hit_bank and not hit_econ
 
 
-# -------------------- QUALITY GUARDS (STRICT) --------------------
-VAGUE_PHRASES = [
-    "recently concluded", "significant conference", "took place recently",
-    "focusing on", "important conference", "major conference", "recent defence conference",
+# -------------------- INTERNATIONAL MIN 2 --------------------
+INDIA_MARKERS = [
+    "india", "indian", "bharat", "new delhi", "delhi", "parliament", "lok sabha", "rajya sabha",
+    "uttar pradesh", "bihar", "madhya pradesh", "rajasthan", "gujarat", "maharashtra",
+    "tamil nadu", "karnataka", "kerala", "west bengal", "odisha", "telangana", "andhra pradesh",
+    "punjab", "haryana", "jharkhand", "chhattisgarh", "assam", "sikkim", "goa", "ladakh",
+    "jammu", "kashmir", "lakshadweep", "andaman", "nicobar", "chandigarh", "puducherry",
+    "supreme court", "isro", "drdo", "ministry of", "cabinet", "pm modi"
 ]
 
-STATIC_GK_TRIGGERS = [
-    "what does january", "commemorate", "republic day", "independence day",
-    "labour day", "national youth day", "when is republic day",
+INTERNATIONAL_MARKERS = [
+    "united nations", "un ", "who", "unesco", "imf", "world bank", "wto", "nato",
+    "g20", "brics", "european union", "eu ", "asean", "quad", "opec", "cop"
+]
+
+COUNTRY_MARKERS = [
+    "usa", "u.s.", "united states", "uk", "britain", "russia", "china", "japan", "france",
+    "germany", "canada", "mexico", "brazil", "australia", "south korea", "north korea",
+    "iran", "israel", "saudi", "uae", "qatar", "turkey", "pakistan", "bangladesh",
+    "sri lanka", "nepal", "bhutan", "thailand", "vietnam", "indonesia", "singapore",
+    "egypt", "south africa", "nigeria", "kenya"
+]
+
+def is_international_item(title: str, snippet: str) -> bool:
+    txt = f"{title} {snippet}".lower()
+    if any(k in txt for k in INDIA_MARKERS):
+        return False
+    if any(k in txt for k in INTERNATIONAL_MARKERS) or any(k in txt for k in COUNTRY_MARKERS):
+        return True
+    return False
+
+
+# -------------------- SOURCES (ONLY YOUR 3) --------------------
+def collect_nextias(date_iso: str) -> List[Dict[str, str]]:
+    base = "https://www.nextias.com/daily-current-affairs"
+    html = http_get(base)
+
+    links = re.findall(r'href=["\'](https://www\.nextias\.com/daily-current-affairs/[^"\']+)["\']', html, re.I)
+    links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
+    links = list(dict.fromkeys(links))[:120]
+
+    items = []
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            if pub == date_iso or pub == "":
+                items.append({"source": "NextIAS", "url": url, "title": title, "date": pub or date_iso})
+        except Exception:
+            continue
+    return items
+
+
+def collect_gktoday(date_iso: str) -> List[Dict[str, str]]:
+    base = "https://www.gktoday.in/current-affairs/"
+    html = http_get(base)
+
+    links = re.findall(r'href=["\'](https://www\.gktoday\.in/[^"\']+)["\']', html, re.I)
+    links = [u for u in links if "wp-content" not in u]
+    links = list(dict.fromkeys(links))[:140]
+
+    items = []
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            if pub == date_iso:
+                items.append({"source": "GKToday", "url": url, "title": title, "date": pub})
+        except Exception:
+            continue
+    return items
+
+
+def collect_drishtiias(date_iso: str) -> List[Dict[str, str]]:
+    base = "https://www.drishtiias.com/current-affairs-news-analysis-editorials"
+    html = http_get(base)
+
+    links = re.findall(r'href=["\'](https://www\.drishtiias\.com/current-affairs-news-analysis-editorials/[^"\']+)["\']', html, re.I)
+    links = [u for u in links if u.rstrip("/") != base.rstrip("/")]
+    links = list(dict.fromkeys(links))[:180]
+
+    items = []
+    for url in links:
+        try:
+            page = http_get(url)
+            title = extract_title(page)
+            if not title:
+                continue
+            pub = extract_meta_date(page) or guess_date_from_url(url) or ""
+            if pub == date_iso or pub == "":
+                items.append({"source": "DrishtiIAS", "url": url, "title": title, "date": pub or date_iso})
+        except Exception:
+            continue
+    return items
+
+
+def collect_fresh_items() -> Tuple[str, List[Dict[str, str]]]:
+    today = ist_today_str()
+    yesterday = ist_yesterday_str()
+
+    sources = [collect_nextias, collect_gktoday, collect_drishtiias]
+
+    all_today = []
+    for fn in sources:
+        try:
+            got = fn(today)
+            print(f"✅ {fn.__name__}: {len(got)} items (today/unknown accepted) for {today}")
+            all_today.extend(got)
+        except Exception as e:
+            print(f"⚠️ {fn.__name__} failed: {e}")
+
+    seen = set()
+    dedup = []
+    for it in all_today:
+        h = _url_hash(it["url"])
+        if h not in seen:
+            seen.add(h)
+            dedup.append(it)
+
+    if len(dedup) < 20:
+        all_yday = []
+        for fn in sources:
+            try:
+                all_yday.extend(fn(yesterday))
+            except Exception:
+                continue
+        for it in all_yday:
+            h = _url_hash(it["url"])
+            if h not in seen:
+                seen.add(h)
+                it = dict(it)
+                it["date"] = yesterday
+                dedup.append(it)
+
+    return today, dedup
+
+
+# -------------------- QUALITY GUARDS --------------------
+VAGUE_PHRASES = [
+    "recently concluded", "significant conference", "took place recently",
+    "what kind of events", "what is the focus of", "section cover", "section covers"
 ]
 
 BAD_OPTIONS = ["all of the above", "none of the above", "all above", "none"]
 
 def extract_title_entities(title: str) -> List[str]:
-    """
-    Extract entities from title to force anchoring.
-    Examples: 'Integrated Security Hub', 'Kalai-II', 'SOAR', 'CQB', 'PM Modi'
-    """
     t = title or ""
     entities = set()
 
-    # Acronyms / All-caps words length>=2
     for m in re.findall(r"\b[A-Z]{2,}\b", t):
         entities.add(m)
 
-    # Hyphenated / with digits like Kalai-II, 72nd, etc.
     for m in re.findall(r"\b[A-Za-z]+[-–][A-Za-z0-9]+\b", t):
         entities.add(m)
 
-    # Title-case sequences (2-4 words) like Integrated Security Hub
     for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", t):
         entities.add(m)
 
-    # Single capitalized proper nouns (fallback)
     for m in re.findall(r"\b[A-Z][a-z]{3,}\b", t):
         entities.add(m)
 
-    # remove very generic
-    stop = {"India", "Indian", "January", "February", "March", "April", "May", "June", "July",
-            "August", "September", "October", "November", "December", "Monday", "Tuesday",
-            "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Government", "Ministry"}
+    stop = {
+        "India", "Indian", "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December", "Government", "Ministry"
+    }
     entities = [e for e in entities if e not in stop and len(e) >= 4]
-    # prefer longer entities first
     entities.sort(key=len, reverse=True)
     return entities[:8]
 
@@ -433,14 +449,19 @@ def contains_any_entity(text: str, entities: List[str]) -> bool:
 
 def is_exam_style_direct(qtext: str) -> bool:
     t = (qtext or "").strip().lower()
-    # Reject UPSC-style statements
     if t.startswith(("with reference to", "consider the following statements", "which of the statements")):
         return False
-    # Must be direct question (like daily quiz)
     if not t.endswith("?"):
         return False
     if not t.startswith(("which", "what", "who", "where", "when", "name", "the name")):
-        # allow some direct forms if they still look like MCQ prompt
+        return False
+    return True
+
+def enforce_no_banking_finance_text(text: str) -> bool:
+    low = (text or "").lower()
+    if any(k in low for k in BANK_FIN_BLOCK):
+        if any(k in low for k in ECON_ALLOW) and not any(x in low for x in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
+            return True
         return False
     return True
 
@@ -448,75 +469,87 @@ def passes_hard_filters(mcq: Dict[str, Any], title_entities: List[str]) -> bool:
     q = (mcq.get("question") or "")
     opts = mcq.get("options") or []
     exp = mcq.get("explanation") or ""
+    title = (mcq.get("source_title") or "").lower()
 
-    # Must be anchored: include at least one entity from title in question
+    qlow = q.lower()
+
+    # ✅ HARD BAN: meta/website-structure questions (Important Days/Appointments section type)
+    META_Q_PATTERNS = [
+        "important days", "appointments current affairs", "current affairs section",
+        "section cover", "section covers", "what kind of events does",
+        "what is the focus of", "this section", "the section",
+    ]
+    if any(p in qlow for p in META_Q_PATTERNS):
+        return False
+
+    # ✅ Reject if question is about "section/category" instead of real event
+    if "section" in qlow or "category" in qlow:
+        return False
+
+    # must be anchored to title entities => prevents generic/hallucinated questions
     if not contains_any_entity(q, title_entities):
         return False
 
-    # No vague phrasing
-    low = q.lower()
-    if any(v in low for v in VAGUE_PHRASES):
+    # no meta/list pages
+    if any(p in title for p in BLOCK_TITLE_PHRASES):
         return False
 
-    # No static GK triggers
-    if any(s in low for s in STATIC_GK_TRIGGERS):
+    # no vague/meta questions
+    if any(v in qlow for v in VAGUE_PHRASES):
+        return False
+    if "section" in qlow and ("cover" in qlow or "focus" in qlow):
         return False
 
-    # No all/none options
-    if any((_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS]) for o in opts):
+    # no static GK patterns
+    if any(p in qlow for p in STATIC_GK_PHRASES):
         return False
 
-    # Direct exam style
+    # no all/none options
+    if any(_norm_text(o) in [_norm_text(x) for x in BAD_OPTIONS] for o in opts):
+        return False
+
+    # direct exam style
     if not is_exam_style_direct(q):
         return False
 
-    # Banking/finance ban (question/options/explanation)
-    joined = (q + " " + " ".join(opts) + " " + exp).lower()
-    if any(k in joined for k in BANK_FIN_BLOCK):
-        # allow macro economy ONLY if economy keywords exist AND banking terms are not the core
-        if not any(k in joined for k in ECON_ALLOW):
-            return False
-        # still reject if it's clearly RBI/SEBI/UPI etc.
-        if any(k in joined for k in ["rbi", "sebi", "upi", "rtgs", "neft", "repo", "crr", "slr"]):
-            return False
+    # banking/finance ban
+    joined = (q + " " + " ".join(opts) + " " + exp)
+    if not enforce_no_banking_finance_text(joined):
+        return False
 
-    # Options distinct
+    # options checks
     if len(opts) != 4:
         return False
     if len(set(_norm_text(o) for o in opts)) != 4:
         return False
 
-    # correct_answer mapping
     ca = mcq.get("correct_answer", "")
     if ca not in opts:
         return False
-    if opts.index(ca) != mcq.get("correct_option_id", -1):
-        # auto-fix later; still acceptable
-        pass
 
     return True
 
 
 # -------------------- MCQ GENERATION (ONE ARTICLE -> ONE MCQ) --------------------
-def generate_one_mcq_from_article(article: Dict[str, str], avoid_event_keys: List[str], avoid_qnorms: List[str]) -> Optional[Dict[str, Any]]:
+def generate_one_mcq_from_article(article: Dict[str, Any], avoid_event_keys: List[str], avoid_qnorms: List[str]) -> Optional[Dict[str, Any]]:
     title = article["title"]
     url = article["url"]
     snippet = article["snippet"]
     entities = extract_title_entities(title)
 
-    # Model must use evidence only + must include entity
     system = (
         "You are a daily Current Affairs MCQ setter for SSC/State PCS/Railways/General Govt exams.\n"
-        "Write ONE direct factual MCQ (daily-quiz style) from the given article evidence.\n"
+        "Write ONE direct factual MCQ from the given article evidence.\n"
         "STRICT:\n"
         "- Use ONLY the provided title+snippet. Do NOT add outside facts.\n"
-        "- The question MUST include at least one key entity from the title (proper noun/term).\n"
-        "- Question must start with: Which/What/Who/Where/When/Name and end with '?'.\n"
-        "- Do NOT use: 'With reference to', 'Consider the following statements'.\n"
-        "- Do NOT use 'All of the above' or 'None of the above'.\n"
+        "- Question MUST include at least one key entity from the title.\n"
+        "- Start with Which/What/Who/Where/When/Name and end with '?'.\n"
+        "- Do NOT use: 'With reference to' or 'Consider the following statements'.\n"
+        "- Do NOT use 'All of the above'/'None of the above'.\n"
         "- Do NOT create Banking/Finance CA (RBI/SEBI/UPI/repo/banks/markets). Economy macro allowed.\n"
+        "- Do NOT create meta questions about sections/categories (Important Days/Appointments etc.).\n"
         "- Options must be plausible and same-category.\n"
-        "- correct_answer must exactly match one option; correct_option_id must match it.\n"
+        "- correct_answer must exactly match one option; correct_option_id must match.\n"
         "- Explanation <= 220 chars.\n"
         "- event_key must be a short unique identifier (3–10 words).\n"
     )
@@ -547,18 +580,14 @@ def generate_one_mcq_from_article(article: Dict[str, str], avoid_event_keys: Lis
     )
 
     mcq = json.loads(resp.output_text)
-
-    # Force source fields to match
     mcq["source_title"] = title[:200]
     mcq["source_url"] = url[:400]
 
-    # Fix answer mapping if needed
     opts = mcq.get("options") or []
     ca = mcq.get("correct_answer", "")
     if ca in opts:
         mcq["correct_option_id"] = opts.index(ca)
 
-    # Hard filter check
     if not passes_hard_filters(mcq, entities):
         return None
 
@@ -568,17 +597,17 @@ def generate_one_mcq_from_article(article: Dict[str, str], avoid_event_keys: Lis
 def generate_mcq_set() -> Dict[str, Any]:
     today_label, items = collect_fresh_items()
     if len(items) < 10:
-        raise RuntimeError(f"Not enough fresh items from CA sources. Found {len(items)}.")
+        raise RuntimeError(f"Not enough fresh items from sources. Found {len(items)}.")
 
     hist = load_history()
     used_url_hashes = set(hist.get("url_hashes", [])[-1000:])
     used_event_keys = [_norm_text(x) for x in (hist.get("event_keys", [])[-600:])]
     used_qnorms = hist.get("question_norms", [])[-600:]
 
-    # Build article pool with snippets + filters
     pool = []
     seen_title = set()
-    for it in items[:120]:
+
+    for it in items[:160]:
         uh = _url_hash(it["url"])
         if uh in used_url_hashes:
             continue
@@ -588,32 +617,41 @@ def generate_mcq_set() -> Dict[str, Any]:
             continue
         seen_title.add(tn)
 
+        title_low = (it["title"] or "").lower()
+        if any(p in title_low for p in BLOCK_TITLE_PHRASES):
+            continue
+
         try:
-            snippet = fetch_article_snippet(it["url"], max_chars=1100)
+            snippet = fetch_article_snippet(it["url"], max_chars=1200)
         except Exception:
             snippet = ""
 
-        # filter banking/finance at article level
         if is_banking_finance_related(it["title"], snippet):
             continue
 
-        pool.append({**it, "snippet": snippet})
+        pool.append({
+            **it,
+            "snippet": snippet,
+            "is_international": is_international_item(it["title"], snippet),
+        })
 
-    if len(pool) < 14:
-        raise RuntimeError(f"Not enough usable articles after banking/finance filter. Found {len(pool)}.")
+    if len(pool) < 16:
+        raise RuntimeError(f"Not enough usable articles after filters. Found {len(pool)}.")
 
-    # Create 10 MCQs by iterating articles and regenerating when needed
+    rnd = random.Random(today_label)
+    rnd.shuffle(pool)
+
     out: List[Dict[str, Any]] = []
     seen_event = set(_norm_text(x) for x in used_event_keys)
     seen_q = set(_norm_text(x) for x in used_qnorms)
     seen_url = set(used_url_hashes)
+    seen_topic_entities = set()
 
-    max_attempts = 60
+    intl_count = 0
+    MIN_INTL = 2
+
+    max_attempts = 100
     attempts = 0
-
-    # shuffle pool so you don't always pick same order
-    rnd = random.Random(today_label)
-    rnd.shuffle(pool)
 
     i = 0
     while len(out) < 10 and attempts < max_attempts and i < len(pool):
@@ -621,7 +659,9 @@ def generate_mcq_set() -> Dict[str, Any]:
         i += 1
         attempts += 1
 
-        # Skip if URL already used (extra safety)
+        if intl_count < MIN_INTL and not art.get("is_international", False):
+            continue
+
         if _url_hash(art["url"]) in seen_url:
             continue
 
@@ -640,16 +680,56 @@ def generate_mcq_set() -> Dict[str, Any]:
         if ek in seen_event or qn in seen_q or uh in seen_url:
             continue
 
-        # accept
+        topic_entities = extract_title_entities(mcq["source_title"])
+        topic_key = _norm_text(topic_entities[0]) if topic_entities else ""
+        if topic_key and topic_key in seen_topic_entities:
+            continue
+
         seen_event.add(ek)
         seen_q.add(qn)
         seen_url.add(uh)
+        if topic_key:
+            seen_topic_entities.add(topic_key)
+
         out.append(mcq)
+        if art.get("is_international", False):
+            intl_count += 1
+
+    if len(out) < 10:
+        for art in pool:
+            if len(out) >= 10:
+                break
+            if _url_hash(art["url"]) in seen_url:
+                continue
+            mcq = generate_one_mcq_from_article(
+                art,
+                avoid_event_keys=list(seen_event),
+                avoid_qnorms=list(seen_q),
+            )
+            if not mcq:
+                continue
+            ek = _norm_text(mcq["event_key"])
+            qn = _norm_text(mcq["question"])
+            uh = _url_hash(mcq["source_url"])
+            if ek in seen_event or qn in seen_q or uh in seen_url:
+                continue
+            topic_entities = extract_title_entities(mcq["source_title"])
+            topic_key = _norm_text(topic_entities[0]) if topic_entities else ""
+            if topic_key and topic_key in seen_topic_entities:
+                continue
+            seen_event.add(ek)
+            seen_q.add(qn)
+            seen_url.add(uh)
+            if topic_key:
+                seen_topic_entities.add(topic_key)
+            out.append(mcq)
 
     if len(out) < 10:
         raise RuntimeError(f"Could not build 10 high-quality anchored MCQs. Got {len(out)}.")
+    if intl_count < MIN_INTL:
+        raise RuntimeError(f"Could not reach {MIN_INTL} international MCQs. Got {intl_count}.")
 
-    return {"date": today_label, "mcqs": out}
+    return {"date": today_label, "mcqs": out[:10]}
 
 
 # -------------------- QUIZ POSTING --------------------
