@@ -16,10 +16,9 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
-# -------------------- LOGGING HELPER --------------------
 def log(msg):
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
-    sys.stdout.flush() # Forces terminal to show the text immediately
+    sys.stdout.flush()
 
 # -------------------- 1. SCRAPER --------------------
 def fetch_factual_news():
@@ -28,10 +27,9 @@ def fetch_factual_news():
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
     except Exception as e:
-        log(f"CRITICAL ERROR: Could not reach Hub URL: {e}")
+        log(f"CRITICAL ERROR: {e}")
         return []
 
-    # Find today's headline link
     daily_link = None
     for a in soup.find_all('a', href=True):
         if "/ca/headlines-of-the-day/" in a['href']:
@@ -39,65 +37,94 @@ def fetch_factual_news():
             break
     
     if not daily_link:
-        log("ERROR: Today's headline link not found on hub page.")
+        log("ERROR: Today's headline link not found.")
         return []
 
-    log(f"Found daily page: {daily_link}. Fetching table...")
-    try:
-        res = requests.get(daily_link, headers=HEADERS, timeout=15)
-        dsoup = BeautifulSoup(res.text, "html.parser")
-    except Exception as e:
-        log(f"ERROR: Could not fetch daily page: {e}")
-        return []
+    log(f"Found daily page: {daily_link}. Fetching details...")
+    res = requests.get(daily_link, headers=HEADERS, timeout=15)
+    dsoup = BeautifulSoup(res.text, "html.parser")
     
     news_items = []
     rows = dsoup.find_all('tr')
-    log(f"Found {len(rows)} rows in table. Processing...")
-
-    for i, row in enumerate(rows):
+    for row in rows:
         cells = row.find_all('td')
         if len(cells) >= 2:
             headline = cells[0].get_text(strip=True)
             link_tag = row.find('a', href=True)
-            
             if link_tag and len(headline) > 20:
                 full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
-                
-                log(f"  -> Extracting details for: {headline[:30]}...")
+                log(f"  -> Extracting: {headline[:40]}...")
                 try:
-                    art_res = requests.get(full_url, headers=HEADERS, timeout=10) # 10 sec timeout per article
+                    art_res = requests.get(full_url, headers=HEADERS, timeout=10)
                     art_soup = BeautifulSoup(art_res.text, "html.parser")
-                    body = " ".join([p.text for p in art_soup.find_all(['p', 'li']) if len(p.text) > 50])
-                    news_items.append({"headline": headline, "content": body[:3000], "url": full_url})
-                except Exception as e:
-                    log(f"     Skipping article: {e}")
-                    continue
-                
+                    content_div = art_soup.find("div", class_=["daily-ca-content", "article-details"])
+                    body = content_div.get_text() if content_div else art_soup.get_text()
+                    news_items.append({"headline": headline, "content": body[:3500], "url": full_url})
+                except: continue
                 if len(news_items) >= 10: break
-    
     return news_items
 
-# -------------------- 2. GENERATOR & POSTER --------------------
-def run():
-    log("=== STARTING DAILY CA BOT ===")
-    
-    # Check Environment Variables
-    if not TELEGRAM_BOT_TOKEN or not client.api_key:
-        log("FATAL: Missing API Tokens. Check your environment variables.")
-        return
+# -------------------- 2. AI GENERATOR --------------------
+def generate_mcqs(news_list):
+    prompt = f"""
+    You are a UPSC Exam setter. Generate EXACTLY 10 factual MCQs.
+    - Focus on data, years, ministries, and facts.
+    - Framing: 'Consider the following statements...', 'Which is correct?'.
+    - Use exactly one MCQ per news item.
+    - JSON format: {{"mcqs": [{{"question": "...", "options": ["A","B","C","D"], "correct_index": 0, "source": "..."}}]}}
+    NEWS: {json.dumps(news_list)}
+    """
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.2
+    )
+    return json.loads(resp.choices[0].message.content).get("mcqs", [])
 
-    data = fetch_factual_news()
-    if not data:
-        log("No data extracted. Exiting.")
-        return
-
-    log(f"Data ready. Sending to OpenAI ({OPENAI_MODEL})...")
-    # [Insert your generate_mcqs logic here]
+# -------------------- 3. TELEGRAM POSTER --------------------
+def post_to_telegram(mcqs):
+    # 1. Post Header
+    date_str = dt.datetime.now().strftime("%d %B %Y")
+    header_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(header_url, json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚀 *Daily MCQ Bulletin: {date_str}*", "parse_mode": "Markdown"})
     
-    log("MCQs generated. Posting to Telegram...")
-    # [Insert your post_to_telegram logic here]
-    
-    log("=== TASK COMPLETE ===")
+    # 2. Post Quiz Polls
+    for m in mcqs:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
+        full_question = f"{m['question'][:250]}\n\nSource: {m['source']}"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "question": full_question,
+            "options": json.dumps(m['options']),
+            "is_anonymous": True,
+            "type": "quiz",
+            "correct_option_id": m['correct_index']
+        }
+        requests.post(url, data=payload)
+        log(f"Posted Poll: {m['question'][:30]}...")
+        time.sleep(2)
 
+    # 3. Post Score Poll (Self-Report)
+    score_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
+    score_payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "question": "📊 Final Score: How many did you get correct?",
+        "options": json.dumps(["0-3 (Need Revision)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
+        "is_anonymous": True,
+        "type": "regular",
+        "allows_multiple_answers": False
+    }
+    requests.post(score_url, data=score_payload)
+    log("Posted Score Poll.")
+
+# -------------------- RUNNER --------------------
 if __name__ == "__main__":
-    run()
+    log("=== STARTING DAILY CA BOT ===")
+    news = fetch_factual_news()
+    if news:
+        log("Sending to OpenAI...")
+        mcqs = generate_mcqs(news)
+        log(f"Generated {len(mcqs)} MCQs. Posting...")
+        post_to_telegram(mcqs)
+    log("=== TASK COMPLETE ===")
