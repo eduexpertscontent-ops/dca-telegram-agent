@@ -23,22 +23,36 @@ def tg_call(method, payload):
     return r.json()
 
 def fetch_content():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(BASE_URL, headers=headers, timeout=20)
-    soup = BeautifulSoup(r.text, "html.parser")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        r = requests.get(BASE_URL, headers=headers, timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        print(f"Error fetching BASE_URL: {e}")
+        return {"headlines": [], "articles": []}
     
-    # 1. Target only the news headline items, usually inside specific article lists
     headlines = []
-    # Narrowing down to common news list patterns for NextIAS
-    news_items = soup.select('div.daily-ca-list-title, h3.title, li.headline-item')
-    for item in news_items:
-        txt = item.get_text(strip=True)
-        # Filter out advertisement keywords
-        if any(word in txt.lower() for word in ["course", "admission", "center", "batch", "ias center"]):
-            continue
-        headlines.append(txt)
     
-    # 2. Extract links to news articles specifically (ignoring static/course pages)
+    # NEW LOGIC: Look for Table rows (NextIAS 2026 style)
+    # Most headlines are inside a table with columns "Headline | Source | Syllabus"
+    rows = soup.find_all('tr')
+    for row in rows:
+        cells = row.find_all('td')
+        if len(cells) >= 2:
+            txt = cells[0].get_text(strip=True)
+            # Filter out advertisements and headers
+            if len(txt) > 20 and not any(word in txt.lower() for word in ["course", "admission", "headline", "syllabus"]):
+                headlines.append(txt)
+
+    # Backup: Look for standard list items if table extraction fails
+    if not headlines:
+        items = soup.find_all(['li', 'h3', 'p'])
+        for item in items:
+            txt = item.get_text(strip=True)
+            if 30 < len(txt) < 200 and not any(word in txt.lower() for word in ["next ias", "enroll", "batch"]):
+                headlines.append(txt)
+    
+    # Extract Article Links (filtering for current affairs)
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -46,63 +60,80 @@ def fetch_content():
             full_url = "https://www.nextias.com" + href if href.startswith("/") else href
             links.append(full_url)
     
-    # 3. Scrape only the main article body from links
+    # Scrape detailed text from the top 5 links
     articles = []
-    for link in list(dict.fromkeys(links))[:8]: # Check top 8 links
+    for link in list(dict.fromkeys(links))[:5]:
         try:
             ar = requests.get(link, headers=headers, timeout=15)
             asoup = BeautifulSoup(ar.text, "html.parser")
-            # TARGETING: NextIAS usually puts article content in a 'details' or 'content' div
-            content_div = asoup.find("div", class_=["daily-ca-content", "article-details", "entry-content"])
-            if content_div:
-                text = " ".join([p.text for p in content_div.find_all(["p", "li"]) if len(p.text) > 40])
+            # NextIAS usually wraps content in these classes
+            content = asoup.find("div", class_=["daily-ca-content", "article-details"])
+            if content:
+                text = " ".join([p.text for p in content.find_all(["p", "li"]) if len(p.text) > 40])
             else:
-                # Fallback but with better filtering
-                text = " ".join([p.text for p in asoup.find_all("p") if len(p.text) > 60 and "admission" not in p.text.lower()])
-            
-            articles.append({"url": link, "text": text[:2500]})
+                text = " ".join([p.text for p in asoup.find_all("p") if len(p.text) > 60])
+            articles.append({"url": link, "text": text[:3000]})
         except: continue
 
-    return {"headlines": headlines[:15], "articles": articles}
+    return {"headlines": headlines, "articles": articles}
 
 def generate_10_mcqs(data):
-    prompt = f"""
-    You are a UPSC Prelims expert. Use ONLY the News Content provided below.
-    
-    STRICT RULE: 
-    - IGNORE all text about NEXT IAS centers, course admissions, or test series.
-    - ONLY create questions from International Relations, Economy, Environment, and National News.
-    - If there is not enough news content, create fewer than 10 MCQs rather than using ad content.
-    
-    HEADLINES: {data['headlines']}
-    ARTICLE CONTENT: {[a['text'] for a in data['articles']]}
-    
-    Output JSON: {{"mcqs": [{{"question": "...", "options": ["A","B","C","D"], "correct_index": 0}}]}}
-    """
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": "Return JSON only. Focus exclusively on actual news topics."}, 
-                  {"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-    return json.loads(resp.choices[0].message.content).get("mcqs", [])[:10]
+    # If no data, return empty
+    if not data['headlines'] and not data['articles']:
+        return []
 
-# -------------------- MAIN EXECUTION --------------------
+    prompt = f"""
+    You are a UPSC Prelims paper setter. Create EXACTLY 10 MCQs based on these news items.
+    
+    NEWS CONTENT:
+    HEADLINES: {data['headlines'][:30]}
+    DETAILED ARTICLES: {[a['text'] for a in data['articles']]}
+    
+    STRICT RULES:
+    1. DO NOT mention Next IAS or any courses.
+    2. Focus only on factual and conceptual news (IR, Economy, Science, Environment).
+    3. Return ONLY a JSON object.
+    
+    FORMAT:
+    {{
+      "mcqs": [
+        {{
+          "question": "...",
+          "options": ["...", "...", "...", "..."],
+          "correct_index": 0
+        }}
+      ]
+    }}
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": "You are a helpful assistant that outputs JSON."}, 
+                      {"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(resp.choices[0].message.content).get("mcqs", [])[:10]
+    except Exception as e:
+        print(f"AI Generation Error: {e}")
+        return []
+
+# -------------------- MAIN --------------------
 def run_daily_quiz():
-    print("Scraping clean news data...")
+    print("Scraping data...")
     raw_data = fetch_content()
     
-    print(f"Content found. Generating MCQs for {len(raw_data['headlines'])} headlines...")
+    print(f"Found {len(raw_data['headlines'])} candidate headlines.")
+    
     mcqs = generate_10_mcqs(raw_data)
     
     if not mcqs:
-        print("AI could not find enough clean news to generate questions.")
+        print("Final Check: No MCQs generated. Verify BASE_URL content.")
         return
 
     date_label = dt.datetime.now().strftime("%d %B %Y")
-    tg_call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ *Current Affairs Quiz: {date_label}*\n(Based on News Headlines)", "parse_mode": "Markdown"})
+    tg_call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"📚 *UPSC Daily MCQ: {date_label}*", "parse_mode": "Markdown"})
     
-    for i, m in enumerate(mcqs):
+    for m in mcqs:
         tg_call("sendPoll", {
             "chat_id": TELEGRAM_CHAT_ID,
             "question": m["question"][:300],
@@ -112,8 +143,6 @@ def run_daily_quiz():
             "correct_option_id": m["correct_index"]
         })
         time.sleep(POLL_DELAY_SECONDS)
-
-    print("Successfully posted MCQs.")
 
 if __name__ == "__main__":
     run_daily_quiz()
