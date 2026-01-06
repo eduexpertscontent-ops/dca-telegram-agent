@@ -1,19 +1,26 @@
 """
-Daily Current Affairs MCQ -> Telegram Poll Poster (UPSC Prelims Std)
-Sources: TOI (Iran advisory), Economic Times (Iran), Reuters (BD T20 WC), TOI (BD), LiveLaw (SC UAPA bail), TOI (SC bail)
+NEXTIAS -> Headlines of the Day + Daily Current Affairs -> UPSC Prelims MCQs -> Telegram Quiz Polls
+(With header: "DCA MCQ - YYYY-MM-DD" and final Score Poll)
 
-What it does:
-1) Fetches text from the fixed source URLs
-2) Asks OpenAI to generate EXACTLY 10 UPSC-prelims style MCQs ONLY from those sources
-3) Validates + shuffles options (so answers won't all be A)
-4) Posts to your Telegram channel as Polls with header "Daily Current Affairs MCQ"
+✅ Extracts from: https://www.nextias.com/daily-current-affairs
+✅ Generates EXACTLY 10 MCQs (UPSC Prelims standard) from extracted content ONLY
+✅ Posts:
+   1) Header message: "DCA MCQ - DATE"
+   2) 10 quiz polls (MCQs)
+   3) 1 score poll at the end
 
-Env vars required:
+--------------------
+REQUIREMENTS:
+pip install requests beautifulsoup4 openai
+
+ENV VARS (Render / local):
 - TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID     (e.g. "@UPPCSSUCCESS")
+- TELEGRAM_CHAT_ID      (e.g. "@UPPCSSUCCESS")
 - OPENAI_API_KEY
 Optional:
-- OPENAI_MODEL (default: "gpt-4o-mini")
+- OPENAI_MODEL          (default "gpt-4o-mini")
+- MAX_MCQS              (default 10)
+- POLL_DELAY_SECONDS    (default 1.2)
 
 Run:
 python run_daily.py
@@ -24,42 +31,36 @@ import re
 import json
 import time
 import random
+import hashlib
 import datetime as dt
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
-# ---------------- CONFIG ----------------
+# -------------------- CONFIG --------------------
+BASE_URL = "https://www.nextias.com/daily-current-affairs"
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Fixed sources (as per your instruction)
-SOURCE_URLS = [
-    # Iran travel advisory
-    "https://timesofindia.indiatimes.com/india/exercise-due-caution-india-issues-travel-advisory-for-iran-urges-nationals-to-avoid-areas-of-protests/articleshow/126355228.cms",
-    "https://m.economictimes.com/news/india/avoid-non-essential-travel-to-iran-india/articleshow/126358992.cms",
-    # Bangladesh T20 World Cup security concerns
-    "https://www.reuters.com/sports/cricket/bangladesh-seeking-move-t20-world-cup-matches-india-report-2026-01-04/",
-    "https://timesofindia.indiatimes.com/sports/cricket/news/safety-and-security-concerns-what-bangladesh-said-on-not-touring-india-for-t20-world-cup/articleshow/126334992.cms",
-    # Supreme Court bail / UAPA
-    "https://www.livelaw.in/top-stories/supreme-court-denies-bail-to-umar-khalid-sharjeel-imam-grants-bail-to-5-others-in-delhi-riots-larger-conspiracy-case-516860",
-    "https://timesofindia.indiatimes.com/india/suprme-court-denies-umar-khalid-sharjeel-imam-bail-allows-it-for-five-co-accused/articleshow/126363870.cms",
-]
+MAX_MCQS = int(os.getenv("MAX_MCQS", "10"))
+POLL_DELAY_SECONDS = float(os.getenv("POLL_DELAY_SECONDS", "1.2"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
-HTTP_TIMEOUT = 20
-MAX_ARTICLE_CHARS = 8000  # keep prompt compact
-POLL_SLEEP_SECONDS = 1.2  # avoid Telegram rate issues
+HTTP_TIMEOUT = 25
+MAX_ARTICLE_CHARS = 7000
+
+HISTORY_FILE = "history_nextias.json"
 
 client = OpenAI()
 
 
-# ---------------- TELEGRAM ----------------
+# -------------------- TELEGRAM --------------------
 def tg(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
@@ -70,15 +71,15 @@ def tg(method: str, payload: dict) -> dict:
     return data
 
 
-def post_header():
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "Daily Current Affairs MCQ"})
+def post_header_with_date(date_str: str):
+    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"DCA MCQ - {date_str}"})
 
 
-def post_poll(question: str, options: list[str], correct_index: int):
+def post_quiz_poll(question: str, options: list[str], correct_index: int):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "question": question[:300],  # Telegram limit safety
-        "options": options[:10],
+        "question": question[:300],
+        "options": options[:4],
         "is_anonymous": True,
         "type": "quiz",
         "correct_option_id": int(correct_index),
@@ -86,157 +87,262 @@ def post_poll(question: str, options: list[str], correct_index: int):
     tg("sendPoll", payload)
 
 
-# ---------------- EXTRACTION ----------------
+def post_score_poll(total_questions: int):
+    # Telegram can't auto-total across multiple quiz polls; this is self-report.
+    if total_questions == 10:
+        options = ["0–2", "3–5", "6–8", "9–10"]
+    else:
+        options = ["0–20%", "21–50%", "51–80%", "81–100%"]
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "question": "Score Poll: How many did you get right? (Self-check)",
+        "options": options,
+        "is_anonymous": True,
+        "type": "regular",
+        "allows_multiple_answers": False,
+    }
+    tg("sendPoll", payload)
+
+
+# -------------------- HELPERS --------------------
 def clean_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def stable_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def load_history() -> dict:
+    if not os.path.exists(HISTORY_FILE):
+        return {"used_fact_hashes": []}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"used_fact_hashes": []}
+
+
+def save_history(hist: dict):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(hist, f, ensure_ascii=False, indent=2)
+
+
+def fetch_html(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+
+# -------------------- NEXTIAS EXTRACTION --------------------
+def get_section_items_by_heading(soup: BeautifulSoup, heading_pattern: str) -> list[str]:
+    """
+    Finds a heading matching heading_pattern and returns bullet items (<li>) below it.
+    Stops at next heading. Works even if site layout shifts slightly.
+    """
+    heading_regex = re.compile(heading_pattern, re.I)
+    heading = None
+    for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
+        if heading_regex.search(tag.get_text(" ", strip=True)):
+            heading = tag
+            break
+    if not heading:
+        return []
+
+    items = []
+    for sib in heading.find_all_next():
+        if sib.name in ["h1", "h2", "h3", "h4"] and sib is not heading:
+            break
+        if sib.name == "li":
+            txt = clean_text(sib.get_text(" ", strip=True))
+            if len(txt) >= 15:
+                items.append(txt)
+
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+
+def extract_latest_ca_links(soup: BeautifulSoup, limit: int = 10) -> list[str]:
+    """
+    Extracts Daily Current Affairs article links from the hub page.
+    Filters for /ca/current-affairs/ URLs.
+    """
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("/"):
+            href = "https://www.nextias.com" + href
+        if "nextias.com/ca/current-affairs" in href:
+            links.append(href.split("?")[0])
+
+    seen = set()
+    uniq = []
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            uniq.append(l)
+
+    return uniq[:limit]
 
 
 def extract_article_text(url: str) -> dict:
     """
-    Lightweight extractor:
-    - grabs title
-    - grabs meta description if present
-    - grabs visible <p> text
-    Note: Some sites (e.g., Reuters) may block. We'll skip if too thin.
+    Extracts visible paragraph/list text from a NextIAS CA article.
     """
-    headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        html = resp.text
+        html = fetch_html(url)
     except Exception as e:
-        return {"url": url, "ok": False, "error": f"fetch_failed: {e}", "title": "", "text": ""}
+        return {"url": url, "ok": False, "title": "", "text": "", "error": f"fetch_failed: {e}"}
 
     soup = BeautifulSoup(html, "html.parser")
-
-    # Remove scripts/styles
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
 
     title = ""
-    if soup.title and soup.title.get_text(strip=True):
-        title = soup.title.get_text(strip=True)
+    if soup.title:
+        title = clean_text(soup.title.get_text(" ", strip=True))
 
-    meta_desc = ""
-    m = soup.find("meta", attrs={"name": "description"})
-    if m and m.get("content"):
-        meta_desc = m["content"].strip()
+    chunks = []
+    for el in soup.find_all(["p", "li"]):
+        txt = clean_text(el.get_text(" ", strip=True))
+        if len(txt) >= 40:
+            chunks.append(txt)
 
-    # Paragraphs
-    ps = [clean_text(p.get_text(" ", strip=True)) for p in soup.find_all("p")]
-    ps = [p for p in ps if len(p) > 40]  # filter very short bits
-    body = " ".join(ps)
-
-    # Combine
-    text = " ".join([t for t in [title, meta_desc, body] if t])
-    text = clean_text(text)
-
-    # trim
+    text = clean_text(" ".join(chunks))
     if len(text) > MAX_ARTICLE_CHARS:
         text = text[:MAX_ARTICLE_CHARS]
 
-    # Heuristic for usable extraction
-    ok = len(text) >= 800
-    return {"url": url, "ok": ok, "error": "" if ok else "too_thin_or_blocked", "title": title, "text": text}
+    ok = len(text) >= 700
+    return {"url": url, "ok": ok, "title": title, "text": text, "error": "" if ok else "too_thin"}
 
 
-def collect_sources() -> list[dict]:
-    items = []
-    for u in SOURCE_URLS:
-        art = extract_article_text(u)
-        items.append(art)
-    # keep only usable
-    usable = [x for x in items if x["ok"]]
-    return usable
+def collect_nextias_content() -> dict:
+    hub_html = fetch_html(BASE_URL)
+    hub_soup = BeautifulSoup(hub_html, "html.parser")
+
+    headlines = get_section_items_by_heading(hub_soup, r"Headlines\s*of\s*the\s*Day")
+    ca_links = extract_latest_ca_links(hub_soup, limit=12)
+
+    articles = []
+    for link in ca_links:
+        art = extract_article_text(link)
+        if art["ok"]:
+            articles.append(art)
+
+    return {
+        "hub_url": BASE_URL,
+        "headlines_of_the_day": headlines,
+        "daily_ca_articles": articles,
+    }
 
 
-# ---------------- MCQ GENERATION ----------------
-def build_prompt(articles: list[dict]) -> str:
-    # pack sources with ids
-    packed = []
-    for i, a in enumerate(articles, start=1):
-        packed.append(
-            f"SOURCE {i}\nURL: {a['url']}\nCONTENT:\n{a['text']}\n"
+# -------------------- MCQ GENERATION --------------------
+def build_prompt(payload: dict, hist: dict) -> str:
+    used_hashes = set(hist.get("used_fact_hashes", []))
+
+    headlines = payload.get("headlines_of_the_day", [])
+    headlines_block = "\n".join([f"- {h}" for h in headlines[:40]])
+
+    article_blocks = []
+    for a in payload.get("daily_ca_articles", [])[:10]:
+        article_blocks.append(
+            f"TITLE: {a['title']}\nURL: {a['url']}\nCONTENT:\n{a['text']}\n"
         )
-    sources_blob = "\n\n".join(packed)
+    articles_block = "\n\n".join(article_blocks)
+
+    used_hashes_block = "\n".join(list(used_hashes)[-300:])
 
     return f"""
-You are an exam-focused Current Affairs MCQ generator for UPSC Prelims.
+You are a UPSC Prelims MCQ setter.
 
-STRICT REQUIREMENTS:
-- Generate EXACTLY 10 UPSC Prelims-standard MCQs.
-- You MUST use ONLY the facts present in the provided sources. Do NOT use outside knowledge.
-- Do NOT invent dates, names, numbers, places, or claims not explicitly present in sources.
-- Each MCQ must have exactly 4 options and only 1 correct option.
-- Difficulty: Easy to Moderate; factual, elimination-friendly.
-- Avoid multi-statement questions.
-- No explanations.
+TASK:
+Generate EXACTLY {MAX_MCQS} UPSC Prelims-standard Current Affairs MCQs using ONLY the provided NextIAS content.
+
+CRITICAL EXAM RULES:
+1) Use ONLY facts explicitly present in the content. Do NOT use outside knowledge.
+2) UPSC framing: direct factual questions; avoid analytical framing.
+3) ONE MCQ per distinct news topic (NO repetition of the same event/theme).
+4) Prefer high-value items: first/largest, govt initiatives, indices/reports, major national/international developments.
+5) Avoid routine advisories/court procedural trivia unless it is clearly a major, UPSC-relevant issue.
+6) EXACTLY 4 options; only ONE correct; plausible same-category options.
+7) No explanations.
+
+ANTI-REPEAT:
+Avoid reusing facts that match these historical hashes (best effort):
+{used_hashes_block}
 
 OUTPUT JSON ONLY in this schema:
 {{
   "mcqs": [
     {{
       "question": "...",
-      "options": ["A", "B", "C", "D"],
+      "options": ["...", "...", "...", "..."],
       "correct_option_index": 0,
-      "source_url": "one of the provided URLs"
+      "source_url": "must be either the hub URL or one of the article URLs",
+      "fact_fingerprint": "short unique phrase describing the key fact (e.g., 'LEDC formed under I&B')"
     }}
   ]
 }}
 
-Also:
-- "source_url" must be exactly one of the provided URLs.
-- Ensure "correct_option_index" is 0-3.
-- Options must be unique and non-empty.
+INPUTS:
 
-SOURCES:
-{sources_blob}
+HUB URL:
+{payload.get("hub_url")}
+
+HEADLINES OF THE DAY:
+{headlines_block}
+
+DAILY CURRENT AFFAIRS ARTICLES:
+{articles_block}
 """.strip()
 
 
-def generate_mcqs_from_sources(articles: list[dict]) -> dict:
-    prompt = build_prompt(articles)
-
+def generate_mcqs(payload: dict, hist: dict) -> dict:
+    prompt = build_prompt(payload, hist)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": "Return JSON only. No markdown."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.3,
+        temperature=0.25,
     )
-
     content = resp.choices[0].message.content.strip()
 
-    # hard JSON parse
     try:
-        data = json.loads(content)
+        return json.loads(content)
     except Exception:
-        # attempt to salvage JSON if model wrapped text
         m = re.search(r"\{.*\}", content, flags=re.S)
         if not m:
             raise RuntimeError(f"Model did not return JSON. Got:\n{content[:800]}")
-        data = json.loads(m.group(0))
-
-    return data
+        return json.loads(m.group(0))
 
 
-# ---------------- VALIDATION + SHUFFLE ----------------
-def normalize_mcq(mcq: dict) -> dict:
+def normalize_and_shuffle(mcq: dict, allowed_sources: set[str]) -> dict:
     q = clean_text(mcq.get("question", ""))
     opts = mcq.get("options", [])
     idx = mcq.get("correct_option_index", None)
-    src = mcq.get("source_url", "")
+    src = clean_text(mcq.get("source_url", ""))
+    fp = clean_text(mcq.get("fact_fingerprint", ""))
 
     if not q or not isinstance(opts, list) or len(opts) != 4 or idx not in [0, 1, 2, 3]:
-        raise ValueError("Invalid MCQ format")
+        raise ValueError("Invalid MCQ structure from model")
 
     opts = [clean_text(o) for o in opts]
-    if any(not o for o in opts) or len(set(opts)) != 4:
+    if len(set(opts)) != 4 or any(not o for o in opts):
         raise ValueError("Options must be 4 unique non-empty strings")
 
-    # Shuffle options to avoid all answers at same position
+    if src not in allowed_sources:
+        raise ValueError(f"source_url not allowed: {src}")
+
     correct_text = opts[idx]
     shuffled = opts[:]
     random.shuffle(shuffled)
@@ -247,59 +353,60 @@ def normalize_mcq(mcq: dict) -> dict:
         "options": shuffled,
         "correct_option_index": new_idx,
         "source_url": src,
+        "fact_fingerprint": fp or q[:60],
     }
 
 
-def validate_sources_in_mcqs(mcqs: list[dict], allowed_urls: set[str]) -> list[dict]:
-    out = []
-    for m in mcqs:
-        nm = normalize_mcq(m)
-        if nm["source_url"] not in allowed_urls:
-            raise ValueError(f"MCQ source_url not in allowed list: {nm['source_url']}")
-        out.append(nm)
-    if len(out) != 10:
-        raise ValueError(f"Expected 10 MCQs, got {len(out)}")
-    return out
-
-
-# ---------------- MAIN ----------------
+# -------------------- MAIN --------------------
 def main():
-    today = dt.datetime.now().strftime("%Y-%m-%d")
+    date_str = dt.datetime.now().strftime("%Y-%m-%d")
+    hist = load_history()
 
-    articles = collect_sources()
-    if not articles:
-        # fail-safe: just post header + message
-        post_header()
-        tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "No verified exam-relevant current affairs available from the configured sources today."})
+    payload = collect_nextias_content()
+    allowed_sources = {payload["hub_url"]} | {a["url"] for a in payload["daily_ca_articles"]}
+
+    if not payload["headlines_of_the_day"] and not payload["daily_ca_articles"]:
+        post_header_with_date(date_str)
+        tg(
+            "sendMessage",
+            {"chat_id": TELEGRAM_CHAT_ID, "text": "No usable current affairs content could be extracted today."},
+        )
         return
 
-    data = generate_mcqs_from_sources(articles)
-    mcqs = data.get("mcqs", [])
-    allowed = set(a["url"] for a in articles)
+    data = generate_mcqs(payload, hist)
+    mcqs_raw = data.get("mcqs", [])
+    if not isinstance(mcqs_raw, list) or len(mcqs_raw) == 0:
+        post_header_with_date(date_str)
+        tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "No MCQs generated today (insufficient content)."})
+        return
 
-    mcqs = validate_sources_in_mcqs(mcqs, allowed)
+    # Normalize + validate + shuffle
+    mcqs = []
+    for m in mcqs_raw[:MAX_MCQS]:
+        mcqs.append(normalize_and_shuffle(m, allowed_sources))
 
-    # Post
-    post_header()
+    if len(mcqs) < 3:
+        post_header_with_date(date_str)
+        tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "Insufficient high-value exam-relevant news today to generate MCQs."})
+        return
+
+    # Post sequence: header -> 10 quiz polls -> score poll
+    post_header_with_date(date_str)
+
     for m in mcqs:
-        post_poll(m["question"], m["options"], m["correct_option_index"])
-        time.sleep(POLL_SLEEP_SECONDS)
+        post_quiz_poll(m["question"], m["options"], m["correct_option_index"])
+        time.sleep(POLL_DELAY_SECONDS)
 
-    # Optional: post sources as one message (comment out if you don't want in channel)
-    src_lines = []
-    used_urls = []
+    post_score_poll(total_questions=len(mcqs))
+
+    # Update history
+    used = hist.get("used_fact_hashes", [])
     for m in mcqs:
-        used_urls.append(m["source_url"])
-    # keep unique, preserve order
-    seen = set()
-    for u in used_urls:
-        if u not in seen:
-            seen.add(u)
-            src_lines.append(u)
+        used.append(stable_hash(m["fact_fingerprint"].lower()))
+    hist["used_fact_hashes"] = used[-800:]
+    save_history(hist)
 
-    tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "Sources:\n" + "\n".join(src_lines)})
-
-    print(f"✅ Posted 10 MCQs for {today} successfully.")
+    print(f"✅ Posted {len(mcqs)} MCQs for {date_str} successfully.")
 
 
 if __name__ == "__main__":
