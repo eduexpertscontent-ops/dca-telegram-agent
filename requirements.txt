@@ -1,2 +1,5 @@
 requests
 openai
+feedparser
+beautifulsoup4
+python-dateutil
