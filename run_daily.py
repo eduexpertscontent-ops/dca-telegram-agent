@@ -12,107 +12,81 @@ BASE_URL = "https://www.nextias.com/daily-current-affairs"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-POLL_DELAY_SECONDS = 2.0 
+POLL_DELAY_SECONDS = 2.5 
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# -------------------- CORE FUNCTIONS --------------------
-def tg_call(method, payload):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
-    return r.json()
-
-def fetch_detailed_data():
+# -------------------- SCRAPER LOGIC --------------------
+def fetch_deep_content():
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     try:
         r = requests.get(BASE_URL, headers=headers, timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Connection Error: {e}")
         return []
 
-    news_data = []
-    # 1. Target the Table specifically to get Headlines + Source Links
+    extracted_data = []
+    # TARGETING: The 2026 Headlines Table
     rows = soup.find_all('tr')
-    
+    print(f"Scanning {len(rows)} table rows...")
+
     for row in rows:
         cells = row.find_all('td')
         if len(cells) >= 2:
-            headline = cells[0].get_text(strip=True)
-            # Find the link in the "Source" or "Headline" column
+            headline_text = cells[0].get_text(strip=True)
+            # Find the first link in this row (usually the deep-dive link)
             link_tag = row.find('a', href=True)
             
-            if link_tag and len(headline) > 20:
+            if link_tag and len(headline_text) > 25:
                 href = link_tag['href']
                 full_url = "https://www.nextias.com" + href if href.startswith("/") else href
                 
-                # Filter out ads
-                if any(word in headline.lower() for word in ["course", "batch", "admission", "ias center"]):
+                # Exclude marketing items
+                if any(x in headline_text.lower() for x in ["course", "admission", "ias center", "batch"]):
                     continue
                 
-                news_data.append({"headline": headline, "url": full_url})
+                extracted_data.append({"headline": headline_text, "url": full_url})
 
-    # 2. Deep Extraction: Visit each link to get the actual news content
-    detailed_news = []
-    print(f"Found {len(news_data)} news links. Starting deep extraction...")
-    
-    for item in news_data[:12]: # Process top 12 to ensure we get 10 high-quality ones
+    # Deep-link extraction (Max 12 to ensure 10 quality MCQs)
+    final_news = []
+    for item in extracted_data[:12]:
         try:
-            print(f"Extracting: {item['headline'][:40]}...")
-            res = requests.get(item['url'], headers=headers, timeout=10)
-            asoup = BeautifulSoup(res.text, "html.parser")
+            print(f"Deep-scraping: {item['headline'][:50]}...")
+            article_res = requests.get(item['url'], headers=headers, timeout=12)
+            a_soup = BeautifulSoup(article_res.text, "html.parser")
             
-            # Target the actual article body
-            content_div = asoup.find("div", class_=["daily-ca-content", "article-details", "entry-content"])
+            # Content is usually in these specific divs
+            content_div = a_soup.find("div", class_=["daily-ca-content", "article-details", "entry-content"])
             if content_div:
-                body_text = " ".join([p.get_text() for p in content_div.find_all(["p", "li"]) if len(p.get_text()) > 30])
+                body = " ".join([p.get_text() for p in content_div.find_all(["p", "li"]) if len(p.get_text()) > 40])
             else:
-                body_text = " ".join([p.get_text() for p in asoup.find_all("p") if len(p.get_text()) > 50])
+                body = " ".join([p.get_text() for p in a_soup.find_all("p") if len(p.get_text()) > 60])
             
-            detailed_news.append({
-                "headline": item['headline'],
-                "content": body_text[:4000], # Limit per article for AI tokens
-                "url": item['url']
-            })
-            time.sleep(1) # Polite delay
-        except:
-            continue
-            
-    return detailed_news
+            final_news.append({"headline": item['headline'], "content": body[:4500], "url": item['url']})
+            time.sleep(1.2) # Avoid rate limits
+        except: continue
 
-def generate_mcqs(news_list):
-    if not news_list:
-        return []
+    return final_news
 
-    # Building a prompt that forces UPSC framing and distinct topics
+def generate_exam_mcqs(news_list):
+    if not news_list: return []
+
     prompt = f"""
-    You are a Senior UPSC Faculty. Generate EXACTLY 10 MCQs based on the detailed news provided.
-    
-    NEWS CONTENT:
+    You are a Senior UPSC Examiner. Generate EXACTLY 10 High-Yield MCQs from this news:
     {json.dumps(news_list, indent=2)}
     
-    STRICT UPSC EXAM RULES:
-    1. FRAMING: Use UPSC style (e.g., 'Consider the following statements', 'Which of the following are correctly matched?').
-    2. DATA: Use specific numbers, years, organizations, and names mentioned in the text.
-    3. UNIQUENESS: Generate exactly ONE question per news topic. Do not repeat topics.
-    4. NO ADS: Never mention 'Next IAS', 'courses', or 'foundation'.
+    STRICT EXAM RULES:
+    1. FRAMING: Use professional phrasing: "Consider the following statements regarding...", "Which of the following is/are correct?", "The term 'X' recently in news refers to...".
+    2. OPTIONS: Options must be logically distracting (A, B, C, D).
+    3. TOPIC: One unique question per news item. Do NOT repeat topics.
+    4. DATA: Include specific figures, years, or organizations mentioned in the text.
     
-    OUTPUT FORMAT: JSON only.
-    {{
-      "mcqs": [
-        {{
-          "question": "...",
-          "options": ["...", "...", "...", "..."],
-          "correct_index": 0,
-          "source": "..."
-        }}
-      ]
-    }}
+    Output JSON: {{"mcqs": [{{"question": "...", "options": ["A","B","C","D"], "correct_index": 0}}]}}
     """
-    
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": "You are a professional examiner. Output strictly in JSON format."}, 
+        messages=[{"role": "system", "content": "Professional UPSC Examiner. JSON output only."}, 
                   {"role": "user", "content": prompt}],
         temperature=0.2,
         response_format={"type": "json_object"}
@@ -120,19 +94,19 @@ def generate_mcqs(news_list):
     return json.loads(resp.choices[0].message.content).get("mcqs", [])[:10]
 
 # -------------------- MAIN --------------------
-def main():
-    print("Step 1: Fetching headlines and source links...")
-    news_list = fetch_detailed_data()
+def run_script():
+    print("Initiating deep-link extraction...")
+    news_list = fetch_deep_content()
     
-    print(f"Step 2: Generating 10 professional MCQs from {len(news_list)} detailed sources...")
-    mcqs = generate_mcqs(news_list)
-    
-    if not mcqs:
-        print("Error: No MCQs generated.")
+    if not news_list:
+        print("No valid news found. Check the website manually.")
         return
 
-    date_label = dt.datetime.now().strftime("%d %B %Y")
-    tg_call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🔥 *UPSC Daily High-Yield MCQ: {date_label}*\n(Based on Detailed Reports)", "parse_mode": "Markdown"})
+    print(f"Generating 10 UPSC-standard MCQs...")
+    mcqs = generate_exam_mcqs(news_list)
+    
+    date_str = dt.datetime.now().strftime("%d %B %Y")
+    tg_call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": f"🎯 *UPSC Prelims Daily Target: {date_str}*", "parse_mode": "Markdown"})
     
     for m in mcqs:
         tg_call("sendPoll", {
@@ -145,5 +119,9 @@ def main():
         })
         time.sleep(POLL_DELAY_SECONDS)
 
+def tg_call(method, payload):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    requests.post(url, json=payload, timeout=20)
+
 if __name__ == "__main__":
-    main()
+    run_script()
