@@ -28,8 +28,17 @@ def run_daily_mcq():
     try:
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
-        daily_link = next(( "https://www.nextias.com" + a['href'] for a in soup.find_all('a', href=True) if "/ca/headlines-of-the-day/" in a['href']), None)
-    except: return
+        
+        daily_link = None
+        for a in soup.find_all('a', href=True):
+            if "/ca/headlines-of-the-day/" in a['href']:
+                href = a['href']
+                # FIX: Smart URL joining to prevent doubling https://
+                daily_link = href if href.startswith("http") else "https://www.nextias.com" + href
+                break
+    except Exception as e:
+        log(f"Hub Error: {e}")
+        return
 
     if not daily_link:
         log("ERROR: No news link found.")
@@ -41,62 +50,99 @@ def run_daily_mcq():
         res = requests.get(daily_link, headers=HEADERS, timeout=15)
         dsoup = BeautifulSoup(res.text, "html.parser")
         news_items = []
+        
         for row in dsoup.find_all('tr'):
             cells = row.find_all('td')
             if len(cells) >= 2:
                 headline = cells[0].get_text(strip=True)
                 link_tag = row.find('a', href=True)
+                
                 if link_tag and len(headline) > 20:
-                    full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
+                    h = link_tag['href']
+                    full_url = h if h.startswith("http") else "https://www.nextias.com" + h
+                    
                     log(f"   -> Scraping: {headline[:40]}...")
-                    art_r = requests.get(full_url, headers=HEADERS, timeout=10)
-                    art_soup = BeautifulSoup(art_r.text, "html.parser")
-                    content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
-                    news_items.append({"headline": headline, "content": content.get_text()[:3000] if content else headline, "url": full_url})
+                    try:
+                        art_r = requests.get(full_url, headers=HEADERS, timeout=10)
+                        art_soup = BeautifulSoup(art_r.text, "html.parser")
+                        content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
+                        news_items.append({
+                            "headline": headline, 
+                            "content": content.get_text()[:3000] if content else headline, 
+                            "url": full_url
+                        })
+                    except:
+                        continue
                 if len(news_items) >= 10: break
     except Exception as e:
         log(f"Scraping Error: {e}")
         return
 
     # 3. Generate MCQs
+    if not news_items:
+        log("ERROR: No news items collected.")
+        return
+
     log(f"Step 3: Sending {len(news_items)} news items to OpenAI...")
     try:
-        prompt = f"""Generate EXACTLY 10 factual UPSC MCQs in JSON format based on the following news. 
-        Each MCQ must have a 'question', 'options' (list of 4 strings), 'correct_index' (0-3), and 'source' (the provided URL).
+        prompt = f"""Generate EXACTLY 10 factual UPSC MCQs in JSON format.
+        Structure: {{"mcqs": [{{"question": "...", "options": ["A","B","C","D"], "correct_index": 0, "source": "..."}}]}}
         
         NEWS DATA: {json.dumps(news_items)}"""
 
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a professional examiner. You must return a JSON object with a single key named 'mcqs' containing a list of objects."},
+                {"role": "system", "content": "You are a UPSC examiner. You must return valid JSON with the key 'mcqs'."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
         )
         
         raw_res = json.loads(resp.choices[0].message.content)
-        # Dynamic key checking to ensure we get the list
-        mcqs = raw_res.get("mcqs") or raw_res.get("questions") or list(raw_res.values())[0]
+        
+        # SMART KEY FINDER: AI sometimes uses "mcqs", "questions", or no key at all
+        mcqs = []
+        if isinstance(raw_res, list):
+            mcqs = raw_res
+        elif "mcqs" in raw_res:
+            mcqs = raw_res["mcqs"]
+        elif "questions" in raw_res:
+            mcqs = raw_res["questions"]
+        else:
+            # Fallback: get the first list found in the dictionary
+            for val in raw_res.values():
+                if isinstance(val, list):
+                    mcqs = val
+                    break
+                    
         log(f"Generated {len(mcqs)} MCQs.")
     except Exception as e:
         log(f"AI ERROR: {e}")
         return
 
     # 4. Post to Telegram
-    if mcqs:
-        log("Step 4: Posting to Telegram...")
-        for m in mcqs:
-            try:
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "question": f"{m['question'][:250]}\n\nSource: {m.get('source', daily_link)}",
-                    "options": json.dumps(m['options']),
-                    "is_anonymous": True, "type": "quiz", "correct_option_id": m['correct_index']
-                }
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll", data=payload)
-                time.sleep(2)
-            except: continue
+    if not mcqs:
+        log("No MCQs found in AI response.")
+        return
+
+    log("Step 4: Posting to Telegram...")
+    for m in mcqs:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "question": f"{m['question'][:250]}\n\nSource: {m.get('source', 'NextIAS')}",
+                "options": json.dumps(m['options']),
+                "is_anonymous": True,
+                "type": "quiz",
+                "correct_option_id": int(m['correct_index'])
+            }
+            requests.post(url, data=payload)
+            time.sleep(2)
+        except Exception as e:
+            log(f"Telegram Error: {e}")
+            continue
 
     log("=== TASK COMPLETE ===")
 
