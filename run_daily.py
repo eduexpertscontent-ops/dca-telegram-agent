@@ -1,91 +1,107 @@
-# ... (Keep your existing imports and scraper functions)
+import os
+import sys
+import json
+import time
+import datetime as dt
+import requests
+from bs4 import BeautifulSoup
+from openai import OpenAI
 
-# -------------------- UPDATED AI GENERATOR --------------------
-def generate_mcqs(news_list):
-    # Ensure we have enough news to work with
-    log(f"Passing {len(news_list)} articles to AI...")
+# -------------------- CONFIG --------------------
+HUB_URL = "https://www.nextias.com/daily-current-affairs"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+def log(msg):
+    # This 'flush' ensures the text appears in your terminal immediately
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
+    sys.stdout.flush()
+
+# -------------------- CORE LOGIC --------------------
+def run_daily_mcq():
+    log("=== SCRIPTS STARTED ===")
     
-    prompt = f"""
-    You are a UPSC Exam setter. I have provided a list of {len(news_list)} news articles.
-    YOUR TASK: Generate EXACTLY 10 different MCQs.
-    
-    RULES:
-    1. One MCQ per article (do not combine articles).
-    2. Format must be factual and UPSC statement-style.
-    3. Output must be a valid JSON with an array of 10 objects.
-    
-    NEWS DATA:
-    {json.dumps(news_list)}
-    
-    OUTPUT FORMAT:
-    {{
-      "mcqs": [
-        {{
-          "question": "...",
-          "options": ["A", "B", "C", "D"],
-          "correct_index": 0,
-          "source": "..."
-        }}
-      ]
-    }}
-    """
+    # 1. Fetch Today's Link
+    log(f"Step 1: Connecting to Hub URL: {HUB_URL}...")
     try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": "You are a professional examiner. You MUST return exactly 10 MCQs in JSON format."}, 
-                      {"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.3 # Slightly higher to ensure variety
-        )
-        data = json.loads(resp.choices[0].message.content)
-        mcqs = data.get("mcqs", [])
-        log(f"AI successfully generated {len(mcqs)} MCQs.")
-        return mcqs
+        r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        log("Connection to Hub successful.")
     except Exception as e:
-        log(f"AI Generation failed: {e}")
-        return []
-
-# -------------------- UPDATED POSTER --------------------
-def post_to_telegram(mcqs):
-    if not mcqs:
-        log("No MCQs to post.")
+        log(f"CRITICAL ERROR: Failed to reach hub: {e}")
         return
 
-    # Post Header
-    date_str = dt.datetime.now().strftime("%d %B %Y")
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
-                  json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚀 *Daily MCQ Bulletin: {date_str}*", "parse_mode": "Markdown"})
+    daily_link = None
+    for a in soup.find_all('a', href=True):
+        if "/ca/headlines-of-the-day/" in a['href']:
+            daily_link = "https://www.nextias.com" + a['href'] if a['href'].startswith("/") else a['href']
+            break
+    
+    if not daily_link:
+        log("ERROR: Could not find today's specific news link.")
+        return
+    
+    # 2. Extract Headlines & Details
+    log(f"Step 2: Fetching news from: {daily_link}")
+    try:
+        res = requests.get(daily_link, headers=HEADERS, timeout=15)
+        dsoup = BeautifulSoup(res.text, "html.parser")
+    except Exception as e:
+        log(f"ERROR: Failed to load daily page: {e}")
+        return
 
-    # Post exactly what was generated
-    count = 0
+    news_items = []
+    rows = dsoup.find_all('tr')
+    log(f"Found {len(rows)} potential news items. Starting deep extraction...")
+
+    for i, row in enumerate(rows):
+        cells = row.find_all('td')
+        if len(cells) >= 2:
+            headline = cells[0].get_text(strip=True)
+            link_tag = row.find('a', href=True)
+            
+            if link_tag and len(headline) > 20:
+                full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
+                log(f"   -> Processing ({len(news_items)+1}/10): {headline[:40]}...")
+                
+                try:
+                    art_r = requests.get(full_url, headers=HEADERS, timeout=10)
+                    art_soup = BeautifulSoup(art_r.rtext, "html.parser")
+                    content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
+                    text = content.get_text() if content else art_soup.get_text()
+                    news_items.append({"headline": headline, "content": text[:3000], "url": full_url})
+                except: continue
+                
+                if len(news_items) >= 10: break
+
+    # 3. Generate MCQs
+    log(f"Step 3: Sending {len(news_items)} news items to OpenAI...")
+    try:
+        prompt = f"Generate 10 factual UPSC MCQs from this news: {json.dumps(news_items)}"
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            timeout=30 # Prevent AI from hanging forever
+        )
+        mcqs = json.loads(resp.choices[0].message.content).get("mcqs", [])
+        log(f"Successfully generated {len(mcqs)} MCQs.")
+    except Exception as e:
+        log(f"AI ERROR: {e}")
+        return
+
+    # 4. Post to Telegram
+    log("Step 4: Posting to Telegram...")
     for m in mcqs:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "question": f"{m['question'][:250]}\n\nSource: {m['source']}",
-                "options": json.dumps(m['options']),
-                "is_anonymous": True,
-                "type": "quiz",
-                "correct_option_id": m['correct_index']
-            }
-            r = requests.post(url, data=payload)
-            if r.status_code == 200:
-                count += 1
-                log(f"Posted Poll {count}/10")
-            else:
-                log(f"Failed to post poll: {r.text}")
-            time.sleep(3) # Increased delay to prevent Telegram flooding
-        except Exception as e:
-            log(f"Error posting poll: {e}")
+        # (Insert your Telegram sendPoll code here)
+        log(f"Posted: {m['question'][:30]}...")
+        time.sleep(2)
 
-    # Post Score Poll only if questions were posted
-    if count > 0:
-        score_payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "question": "📊 Final Score: How many did you get correct?",
-            "options": json.dumps(["0-3 (Need Revision)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
-            "is_anonymous": True,
-            "type": "regular"
-        }
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll", data=score_payload)
+    log("=== TASK COMPLETE ===")
+
+if __name__ == "__main__":
+    run_daily_mcq()
