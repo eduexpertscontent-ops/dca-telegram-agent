@@ -17,7 +17,6 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 def log(msg):
-    # This 'flush' ensures the text appears in your terminal immediately
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
     sys.stdout.flush()
 
@@ -26,13 +25,11 @@ def run_daily_mcq():
     log("=== SCRIPTS STARTED ===")
     
     # 1. Fetch Today's Link
-    log(f"Step 1: Connecting to Hub URL: {HUB_URL}...")
     try:
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
-        log("Connection to Hub successful.")
     except Exception as e:
-        log(f"CRITICAL ERROR: Failed to reach hub: {e}")
+        log(f"CRITICAL ERROR: {e}")
         return
 
     daily_link = None
@@ -42,23 +39,22 @@ def run_daily_mcq():
             break
     
     if not daily_link:
-        log("ERROR: Could not find today's specific news link.")
+        log("ERROR: No news link found.")
         return
     
-    # 2. Extract Headlines & Details
-    log(f"Step 2: Fetching news from: {daily_link}")
+    # 2. Extract Details
+    log(f"Step 2: Fetching from: {daily_link}")
     try:
         res = requests.get(daily_link, headers=HEADERS, timeout=15)
         dsoup = BeautifulSoup(res.text, "html.parser")
     except Exception as e:
-        log(f"ERROR: Failed to load daily page: {e}")
+        log(f"ERROR: {e}")
         return
 
     news_items = []
     rows = dsoup.find_all('tr')
-    log(f"Found {len(rows)} potential news items. Starting deep extraction...")
-
-    for i, row in enumerate(rows):
+    
+    for row in rows:
         cells = row.find_all('td')
         if len(cells) >= 2:
             headline = cells[0].get_text(strip=True)
@@ -66,30 +62,47 @@ def run_daily_mcq():
             
             if link_tag and len(headline) > 20:
                 full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
-                log(f"   -> Processing ({len(news_items)+1}/10): {headline[:40]}...")
+                log(f"   -> Scraping: {headline[:40]}...")
                 
                 try:
                     art_r = requests.get(full_url, headers=HEADERS, timeout=10)
-                    art_soup = BeautifulSoup(art_r.rtext, "html.parser")
+                    # FIX: Changed art_r.rtext to art_r.text
+                    art_soup = BeautifulSoup(art_r.text, "html.parser")
                     content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
                     text = content.get_text() if content else art_soup.get_text()
-                    news_items.append({"headline": headline, "content": text[:3000], "url": full_url})
-                except: continue
+                    
+                    # Store as dictionary
+                    news_items.append({
+                        "headline": headline, 
+                        "content": text[:3000].strip(), 
+                        "url": full_url
+                    })
+                except Exception as e:
+                    log(f"      Skip: {e}")
+                    continue
                 
                 if len(news_items) >= 10: break
 
     # 3. Generate MCQs
+    if not news_items:
+        log("ERROR: news_items list is empty. Check extraction logic.")
+        return
+
     log(f"Step 3: Sending {len(news_items)} news items to OpenAI...")
     try:
-        prompt = f"Generate 10 factual UPSC MCQs from this news: {json.dumps(news_items)}"
+        # FIX: Added "JSON" explicitly to the prompt to satisfy API requirements
+        prompt = f"Generate exactly 10 factual UPSC MCQs in JSON format from this news: {json.dumps(news_items)}"
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": "You are a professional examiner. You must output the result in a valid JSON object format."},
+                {"role": "user", "content": prompt}
+            ],
             response_format={"type": "json_object"},
-            timeout=30 # Prevent AI from hanging forever
+            timeout=40
         )
         mcqs = json.loads(resp.choices[0].message.content).get("mcqs", [])
-        log(f"Successfully generated {len(mcqs)} MCQs.")
+        log(f"Generated {len(mcqs)} MCQs.")
     except Exception as e:
         log(f"AI ERROR: {e}")
         return
@@ -97,9 +110,18 @@ def run_daily_mcq():
     # 4. Post to Telegram
     log("Step 4: Posting to Telegram...")
     for m in mcqs:
-        # (Insert your Telegram sendPoll code here)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "question": f"{m['question'][:250]}\n\nSource: {m.get('source', daily_link)}",
+            "options": json.dumps(m['options']),
+            "is_anonymous": True,
+            "type": "quiz",
+            "correct_option_id": m['correct_index']
+        }
+        requests.post(url, data=payload)
         log(f"Posted: {m['question'][:30]}...")
-        time.sleep(2)
+        time.sleep(3)
 
     log("=== TASK COMPLETE ===")
 
