@@ -28,16 +28,9 @@ def run_daily_mcq():
     try:
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        log(f"CRITICAL ERROR: {e}")
-        return
+        daily_link = next(( "https://www.nextias.com" + a['href'] for a in soup.find_all('a', href=True) if "/ca/headlines-of-the-day/" in a['href']), None)
+    except: return
 
-    daily_link = None
-    for a in soup.find_all('a', href=True):
-        if "/ca/headlines-of-the-day/" in a['href']:
-            daily_link = "https://www.nextias.com" + a['href'] if a['href'].startswith("/") else a['href']
-            break
-    
     if not daily_link:
         log("ERROR: No news link found.")
         return
@@ -47,81 +40,63 @@ def run_daily_mcq():
     try:
         res = requests.get(daily_link, headers=HEADERS, timeout=15)
         dsoup = BeautifulSoup(res.text, "html.parser")
-    except Exception as e:
-        log(f"ERROR: {e}")
-        return
-
-    news_items = []
-    rows = dsoup.find_all('tr')
-    
-    for row in rows:
-        cells = row.find_all('td')
-        if len(cells) >= 2:
-            headline = cells[0].get_text(strip=True)
-            link_tag = row.find('a', href=True)
-            
-            if link_tag and len(headline) > 20:
-                full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
-                log(f"   -> Scraping: {headline[:40]}...")
-                
-                try:
+        news_items = []
+        for row in dsoup.find_all('tr'):
+            cells = row.find_all('td')
+            if len(cells) >= 2:
+                headline = cells[0].get_text(strip=True)
+                link_tag = row.find('a', href=True)
+                if link_tag and len(headline) > 20:
+                    full_url = "https://www.nextias.com" + link_tag['href'] if link_tag['href'].startswith("/") else link_tag['href']
+                    log(f"   -> Scraping: {headline[:40]}...")
                     art_r = requests.get(full_url, headers=HEADERS, timeout=10)
-                    # FIX: Changed art_r.rtext to art_r.text
                     art_soup = BeautifulSoup(art_r.text, "html.parser")
                     content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
-                    text = content.get_text() if content else art_soup.get_text()
-                    
-                    # Store as dictionary
-                    news_items.append({
-                        "headline": headline, 
-                        "content": text[:3000].strip(), 
-                        "url": full_url
-                    })
-                except Exception as e:
-                    log(f"      Skip: {e}")
-                    continue
-                
+                    news_items.append({"headline": headline, "content": content.get_text()[:3000] if content else headline, "url": full_url})
                 if len(news_items) >= 10: break
-
-    # 3. Generate MCQs
-    if not news_items:
-        log("ERROR: news_items list is empty. Check extraction logic.")
+    except Exception as e:
+        log(f"Scraping Error: {e}")
         return
 
+    # 3. Generate MCQs
     log(f"Step 3: Sending {len(news_items)} news items to OpenAI...")
     try:
-        # FIX: Added "JSON" explicitly to the prompt to satisfy API requirements
-        prompt = f"Generate exactly 10 factual UPSC MCQs in JSON format from this news: {json.dumps(news_items)}"
+        prompt = f"""Generate EXACTLY 10 factual UPSC MCQs in JSON format based on the following news. 
+        Each MCQ must have a 'question', 'options' (list of 4 strings), 'correct_index' (0-3), and 'source' (the provided URL).
+        
+        NEWS DATA: {json.dumps(news_items)}"""
+
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a professional examiner. You must output the result in a valid JSON object format."},
+                {"role": "system", "content": "You are a professional examiner. You must return a JSON object with a single key named 'mcqs' containing a list of objects."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"},
-            timeout=40
+            response_format={"type": "json_object"}
         )
-        mcqs = json.loads(resp.choices[0].message.content).get("mcqs", [])
+        
+        raw_res = json.loads(resp.choices[0].message.content)
+        # Dynamic key checking to ensure we get the list
+        mcqs = raw_res.get("mcqs") or raw_res.get("questions") or list(raw_res.values())[0]
         log(f"Generated {len(mcqs)} MCQs.")
     except Exception as e:
         log(f"AI ERROR: {e}")
         return
 
     # 4. Post to Telegram
-    log("Step 4: Posting to Telegram...")
-    for m in mcqs:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "question": f"{m['question'][:250]}\n\nSource: {m.get('source', daily_link)}",
-            "options": json.dumps(m['options']),
-            "is_anonymous": True,
-            "type": "quiz",
-            "correct_option_id": m['correct_index']
-        }
-        requests.post(url, data=payload)
-        log(f"Posted: {m['question'][:30]}...")
-        time.sleep(3)
+    if mcqs:
+        log("Step 4: Posting to Telegram...")
+        for m in mcqs:
+            try:
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "question": f"{m['question'][:250]}\n\nSource: {m.get('source', daily_link)}",
+                    "options": json.dumps(m['options']),
+                    "is_anonymous": True, "type": "quiz", "correct_option_id": m['correct_index']
+                }
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll", data=payload)
+                time.sleep(2)
+            except: continue
 
     log("=== TASK COMPLETE ===")
 
