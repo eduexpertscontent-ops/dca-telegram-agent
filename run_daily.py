@@ -29,7 +29,6 @@ def fetch_factual_news():
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # Identify the date-specific headlines page
         daily_link = None
         for a in soup.find_all('a', href=True):
             if "/ca/headlines-of-the-day/" in a['href']:
@@ -37,7 +36,9 @@ def fetch_factual_news():
                 daily_link = href if href.startswith("http") else "https://www.nextias.com" + href
                 break
         
-        if not daily_link: return []
+        if not daily_link: 
+            log("No daily headlines link found.")
+            return []
 
         log(f"Step 2: Fetching news from: {daily_link}")
         res = requests.get(daily_link, headers=HEADERS, timeout=15)
@@ -83,10 +84,10 @@ def generate_mcqs(news_list):
     You are a professional UPSC/UPPCS Paper Setter. Create 10 Factual Exam-Standard MCQs in JSON format.
     
     INSTRUCTIONS:
-    1. TAGGING: Include a subject hashtag at the start: #Polity, #Economy, #Geography, #History, #Environment, #IR, or #Science.
+    1. SUBJECT TAGS: Include a subject hashtag at the start: #Polity, #Economy, #Geography, #History, #Environment, #IR, or #Science.
     2. BACKWARD LINKAGE: Don't just ask about the news. Link it to the associated Ministry, Act, Constitution Article, or Location.
-    3. DIFFICULTY: Easy to Moderate. Focus on percentages, names, and factual data.
-    4. EXPLANATION: Provide a short factual explanation (max 200 chars) for the correct answer.
+    3. STRUCTURE: Each object must have: "question", "options", "correct_index", "explanation", "source".
+    4. EXPLANATION: Max 200 chars.
     
     NEWS DATA: {json.dumps(news_list)}
     """
@@ -101,7 +102,24 @@ def generate_mcqs(news_list):
             temperature=0.2
         )
         data = json.loads(resp.choices[0].message.content)
-        return data.get("mcqs") or next(iter(v for v in data.values() if isinstance(v, list)), [])
+        mcqs = data.get("mcqs") or next(iter(v for v in data.values() if isinstance(v, list)), [])
+        
+        # --- ROBUST KEY NORMALIZATION ---
+        normalized_mcqs = []
+        for m in mcqs:
+            # Check for alternative key names the AI might use
+            idx = m.get("correct_index")
+            if idx is None:
+                idx = m.get("answer_index") or m.get("correct_option") or m.get("answer")
+            
+            try:
+                m["correct_index"] = int(idx)
+                normalized_mcqs.append(m)
+            except (TypeError, ValueError):
+                continue # Skip if no valid index found
+                
+        log(f"Successfully prepared {len(normalized_mcqs)} MCQs.")
+        return normalized_mcqs
     except Exception as e:
         log(f"AI Error: {e}")
         return []
@@ -125,11 +143,15 @@ def post_to_telegram(mcqs):
                 "options": json.dumps(m['options']),
                 "is_anonymous": True,
                 "type": "quiz",
-                "correct_option_id": int(m['correct_index']),
+                "correct_option_id": m["correct_index"],
                 "explanation": m.get('explanation', 'Factual revision from today\'s news.')[:200]
             }
-            requests.post(url, data=payload)
-            log(f"   -> Posted {i+1}/10...")
+            res = requests.post(url, data=payload)
+            if res.status_code == 200:
+                log(f"   -> Posted {i+1}/{len(mcqs)}...")
+            else:
+                log(f"   -> API Error MCQ {i+1}: {res.text}")
+            
             time.sleep(2.5)
         except Exception as e:
             log(f"Post Error: {e}")
@@ -138,10 +160,11 @@ def post_to_telegram(mcqs):
     score_payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "question": "📊 Final Score: How many did you get correct?",
-        "options": json.dumps(["0-3 (Needs work)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
+        "options": json.dumps(["0-3 (Need Revision)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
         "is_anonymous": True, "type": "regular"
     }
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll", data=score_payload)
+    log("Final score poll posted.")
 
 # -------------------- MAIN RUNNER --------------------
 if __name__ == "__main__":
