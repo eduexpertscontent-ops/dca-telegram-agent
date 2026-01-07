@@ -8,11 +8,10 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # -------------------- 1. CONFIGURATION --------------------
-# Replace these or set them as Environment Variables
 HUB_URL = "https://www.nextias.com/daily-current-affairs"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = "gpt-4o-mini"
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 HEADERS = {
@@ -23,14 +22,14 @@ def log(msg):
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
     sys.stdout.flush()
 
-# -------------------- 2. SCRAPER (DEEP CRAWL) --------------------
+# -------------------- 2. SCRAPER: DEEP EXTRACTION --------------------
 def fetch_factual_news():
-    log("Connecting to Hub...")
+    log("Step 1: Connecting to Hub...")
     try:
         r = requests.get(HUB_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # Find today's headline page link
+        # Identify the date-specific headlines page
         daily_link = None
         for a in soup.find_all('a', href=True):
             if "/ca/headlines-of-the-day/" in a['href']:
@@ -38,11 +37,9 @@ def fetch_factual_news():
                 daily_link = href if href.startswith("http") else "https://www.nextias.com" + href
                 break
         
-        if not daily_link:
-            log("Daily link not found.")
-            return []
+        if not daily_link: return []
 
-        log(f"Fetching news table from: {daily_link}")
+        log(f"Step 2: Fetching news from: {daily_link}")
         res = requests.get(daily_link, headers=HEADERS, timeout=15)
         dsoup = BeautifulSoup(res.text, "html.parser")
         
@@ -58,16 +55,16 @@ def fetch_factual_news():
                     h_url = link_tag['href']
                     full_url = h_url if h_url.startswith("http") else "https://www.nextias.com" + h_url
                     
-                    log(f"   -> Scraping article: {headline[:35]}...")
+                    log(f"   -> Extracting: {headline[:40]}...")
                     try:
                         art_r = requests.get(full_url, headers=HEADERS, timeout=10)
                         art_soup = BeautifulSoup(art_r.text, "html.parser")
                         content = art_soup.find("div", class_=["daily-ca-content", "article-details"])
-                        body_text = content.get_text() if content else art_soup.get_text()
+                        body = content.get_text() if content else art_soup.get_text()
                         
                         news_items.append({
                             "headline": headline,
-                            "content": body_text[:3000].strip(),
+                            "content": body[:3500].strip(),
                             "url": full_url
                         })
                     except: continue
@@ -80,59 +77,45 @@ def fetch_factual_news():
 # -------------------- 3. AI EXAM-MCQ GENERATOR --------------------
 def generate_mcqs(news_list):
     if not news_list: return []
-    log(f"Generating 10 factual exam-standard MCQs via {OPENAI_MODEL}...")
+    log(f"Step 3: Generating 10 factual exam-standard MCQs...")
     
     prompt = f"""
-    You are a UPSC/UPPCS Paper Setter. Generate 10 Factual, Easy-to-Moderate MCQs.
+    You are a professional UPSC/UPPCS Paper Setter. Create 10 Factual Exam-Standard MCQs in JSON format.
     
-    EXAM STANDARDS:
-    1. BACKWARD LINKAGE: Link news to Static Facts (Geography, Ministry, Law, or Constitution).
-    2. FACTUAL DEPTH: Focus on percentages (e.g., 31.8%), locations (e.g., Tiruchi), and organization names.
-    3. SIMPLICITY: Direct questions. Single correct answer. No complex 'Statement 1 & 2' unless necessary.
+    INSTRUCTIONS:
+    1. TAGGING: Include a subject hashtag at the start: #Polity, #Economy, #Geography, #History, #Environment, #IR, or #Science.
+    2. BACKWARD LINKAGE: Don't just ask about the news. Link it to the associated Ministry, Act, Constitution Article, or Location.
+    3. DIFFICULTY: Easy to Moderate. Focus on percentages, names, and factual data.
+    4. EXPLANATION: Provide a short factual explanation (max 200 chars) for the correct answer.
     
     NEWS DATA: {json.dumps(news_list)}
-    
-    OUTPUT FORMAT (Strict JSON):
-    {{
-      "mcqs": [
-        {{
-          "question": "Example: In which Indian state is the harvest festival Pongal primarily celebrated?",
-          "options": ["Kerala", "Tamil Nadu", "Karnataka", "Andhra Pradesh"],
-          "correct_index": 1,
-          "source": "URL"
-        }}
-      ]
-    }}
     """
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "Professional Factual Examiner. Output valid JSON with 'mcqs' key."},
+                {"role": "system", "content": "Professional Factual Examiner. Return only a JSON object with the key 'mcqs'."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.2
         )
-        raw = json.loads(resp.choices[0].message.content)
-        # Find the list of MCQs regardless of the key the AI used
-        return raw.get("mcqs") or next(iter(v for v in raw.values() if isinstance(v, list)), [])
+        data = json.loads(resp.choices[0].message.content)
+        return data.get("mcqs") or next(iter(v for v in data.values() if isinstance(v, list)), [])
     except Exception as e:
         log(f"AI Error: {e}")
         return []
 
 # -------------------- 4. TELEGRAM POSTER --------------------
 def post_to_telegram(mcqs):
-    if not mcqs:
-        log("No MCQs to post.")
-        return
-
-    # 1. Header DCA - DATE
+    if not mcqs: return
+    
+    # Header: DCA - DATE
     dca_date = dt.datetime.now().strftime("%d %B %Y")
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
                   json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚀 *DCA - {dca_date}*", "parse_mode": "Markdown"})
 
-    # 2. Quiz Polls
+    # Post MCQs
     for i, m in enumerate(mcqs):
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
@@ -142,23 +125,23 @@ def post_to_telegram(mcqs):
                 "options": json.dumps(m['options']),
                 "is_anonymous": True,
                 "type": "quiz",
-                "correct_option_id": int(m['correct_index'])
+                "correct_option_id": int(m['correct_index']),
+                "explanation": m.get('explanation', 'Factual revision from today\'s news.')[:200]
             }
             requests.post(url, data=payload)
-            log(f"Posted {i+1}/10...")
+            log(f"   -> Posted {i+1}/10...")
             time.sleep(2.5)
         except Exception as e:
             log(f"Post Error: {e}")
 
-    # 3. Final Score Poll
+    # Final Score Poll
     score_payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "question": "📊 Final Score: How many did you get correct?",
-        "options": json.dumps(["0-3 (Need Revision)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
+        "options": json.dumps(["0-3 (Needs work)", "4-6 (Good)", "7-8 (Very Good)", "9-10 (Excellent!)"]),
         "is_anonymous": True, "type": "regular"
     }
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll", data=score_payload)
-    log("Score Poll Posted.")
 
 # -------------------- MAIN RUNNER --------------------
 if __name__ == "__main__":
