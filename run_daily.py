@@ -11,7 +11,10 @@ from openai import OpenAI
 HUB_URL = "https://www.nextias.com/daily-current-affairs"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-OPENAI_MODEL = "gpt-4o-mini"
+
+# --- UPDATED FOR 2026 ---
+# Recommended models: "gpt-5.2", "gpt-5.1", or "gpt-5-mini"
+OPENAI_MODEL = "gpt-5.1" 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 HEADERS = {
@@ -75,39 +78,43 @@ def fetch_factual_news():
         log(f"Scraping Error: {e}")
         return []
 
-# -------------------- 3. AI EXAM-MCQ GENERATOR --------------------
+# -------------------- 3. GPT-5 MCQ GENERATOR --------------------
 def generate_mcqs(news_list):
     if not news_list: return []
-    log(f"Step 3: Generating 10 factual exam-standard MCQs...")
+    log(f"Step 3: Generating 10 factual exam-standard MCQs using {OPENAI_MODEL}...")
     
     prompt = f"""
     You are a professional UPSC/UPPCS Paper Setter. Create 10 Factual Exam-Standard MCQs in JSON format.
     
     INSTRUCTIONS:
     1. SUBJECT TAGS: Include a subject hashtag at the start: #Polity, #Economy, #Geography, #History, #Environment, #IR, or #Science.
-    2. BACKWARD LINKAGE: Don't just ask about the news. Link it to the associated Ministry, Act, Constitution Article, or Location.
+    2. BACKWARD LINKAGE: Link the news to the associated Ministry, Act, Constitution Article, or Location.
     3. STRUCTURE: Each object must have: "question", "options", "correct_index", "explanation", "source".
     4. EXPLANATION: Max 200 chars.
     
     NEWS DATA: {json.dumps(news_list)}
     """
     try:
-        resp = client.chat.completions.create(
+        # --- NEW RESPONSES API FOR GPT-5 ---
+        resp = client.responses.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Professional Factual Examiner. Return only a JSON object with the key 'mcqs'."},
+            reasoning={"effort": "medium"},  # Controls GPT-5 thinking depth
+            text={"verbosity": "medium"},     # Controls length/style natively
+            input=[
+                {"role": "developer", "content": "Professional Factual Examiner. Return only JSON with key 'mcqs'."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"},
-            temperature=0.2
+            # Note: response_format is handled within the text parameter in newer SDKs
+            # but standard json_object logic still applies to the prompt instructions.
         )
-        data = json.loads(resp.choices[0].message.content)
+        
+        # GPT-5 Responses API returns text in .output_text
+        data = json.loads(resp.output_text)
         mcqs = data.get("mcqs") or next(iter(v for v in data.values() if isinstance(v, list)), [])
         
         # --- ROBUST KEY NORMALIZATION ---
         normalized_mcqs = []
         for m in mcqs:
-            # Check for alternative key names the AI might use
             idx = m.get("correct_index")
             if idx is None:
                 idx = m.get("answer_index") or m.get("correct_option") or m.get("answer")
@@ -116,12 +123,12 @@ def generate_mcqs(news_list):
                 m["correct_index"] = int(idx)
                 normalized_mcqs.append(m)
             except (TypeError, ValueError):
-                continue # Skip if no valid index found
+                continue 
                 
         log(f"Successfully prepared {len(normalized_mcqs)} MCQs.")
         return normalized_mcqs
     except Exception as e:
-        log(f"AI Error: {e}")
+        log(f"GPT-5 API Error: {e}")
         return []
 
 # -------------------- 4. TELEGRAM POSTER --------------------
