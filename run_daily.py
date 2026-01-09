@@ -12,8 +12,6 @@ HUB_URL = "https://www.nextias.com/daily-current-affairs"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- UPDATED FOR 2026 ---
-# Recommended models: "gpt-5.2", "gpt-5.1", or "gpt-5-mini"
 OPENAI_MODEL = "gpt-5.1" 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -25,7 +23,7 @@ def log(msg):
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
     sys.stdout.flush()
 
-# -------------------- 2. SCRAPER: DEEP EXTRACTION --------------------
+# -------------------- 2. SCRAPER --------------------
 def fetch_factual_news():
     log("Step 1: Connecting to Hub...")
     try:
@@ -86,33 +84,29 @@ def generate_mcqs(news_list):
     prompt = f"""
     You are a professional UPSC/UPPCS Paper Setter. Create 10 Factual Exam-Standard MCQs in JSON format.
     
-    INSTRUCTIONS:
-    1. SUBJECT TAGS: Include a subject hashtag at the start: #Polity, #Economy, #Geography, #History, #Environment, #IR, or #Science.
-    2. BACKWARD LINKAGE: Link the news to the associated Ministry, Act, Constitution Article, or Location.
-    3. STRUCTURE: Each object must have: "question", "options", "correct_index", "explanation", "source".
-    4. EXPLANATION: Max 200 chars.
+    STRICT CONSTRAINTS (Telegram API Limits):
+    1. QUESTION: Must be strictly under 250 characters.
+    2. OPTIONS: Each option must be strictly under 90 characters.
+    3. EXPLANATION: Max 200 chars.
+    4. SUBJECT TAGS: Start question with: #Polity, #Economy, etc.
+    5. STRUCTURE: Each object must have: "question", "options", "correct_index", "explanation", "source".
     
     NEWS DATA: {json.dumps(news_list)}
     """
     try:
-        # --- NEW RESPONSES API FOR GPT-5 ---
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            reasoning={"effort": "medium"},  # Controls GPT-5 thinking depth
-            text={"verbosity": "medium"},     # Controls length/style natively
+            reasoning={"effort": "medium"},
+            text={"verbosity": "medium"},
             input=[
                 {"role": "developer", "content": "Professional Factual Examiner. Return only JSON with key 'mcqs'."},
                 {"role": "user", "content": prompt}
             ],
-            # Note: response_format is handled within the text parameter in newer SDKs
-            # but standard json_object logic still applies to the prompt instructions.
         )
         
-        # GPT-5 Responses API returns text in .output_text
         data = json.loads(resp.output_text)
         mcqs = data.get("mcqs") or next(iter(v for v in data.values() if isinstance(v, list)), [])
         
-        # --- ROBUST KEY NORMALIZATION ---
         normalized_mcqs = []
         for m in mcqs:
             idx = m.get("correct_index")
@@ -135,24 +129,33 @@ def generate_mcqs(news_list):
 def post_to_telegram(mcqs):
     if not mcqs: return
     
-    # Header: DCA - DATE
     dca_date = dt.datetime.now().strftime("%d %B %Y")
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
                   json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚀 *DCA - {dca_date}*", "parse_mode": "Markdown"})
 
-    # Post MCQs
     for i, m in enumerate(mcqs):
         try:
+            # --- FIX: CHARACTER LIMITS COMPLIANCE ---
+            # Telegram question limit is 300. We truncate to 290 to be safe.
+            raw_question = f"{m['question']}\n\nSource: {m.get('source', 'NextIAS')}"
+            safe_question = (raw_question[:297] + '...') if len(raw_question) > 300 else raw_question
+
+            # Telegram option limit is 100.
+            safe_options = []
+            for opt in m['options']:
+                safe_options.append((opt[:97] + '...') if len(opt) > 100 else opt)
+
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll"
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
-                "question": f"{m['question'][:250]}\n\nSource: {m.get('source', 'NextIAS')}",
-                "options": json.dumps(m['options']),
+                "question": safe_question,
+                "options": json.dumps(safe_options),
                 "is_anonymous": True,
                 "type": "quiz",
                 "correct_option_id": m["correct_index"],
-                "explanation": m.get('explanation', 'Factual revision from today\'s news.')[:200]
+                "explanation": m.get('explanation', 'Factual revision.')[:200]
             }
+            
             res = requests.post(url, data=payload)
             if res.status_code == 200:
                 log(f"   -> Posted {i+1}/{len(mcqs)}...")
